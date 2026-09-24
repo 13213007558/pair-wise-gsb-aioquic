@@ -27,6 +27,7 @@ from . import events
 from .configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
 from .congestion.base import K_GRANULARITY
 from .crypto import CryptoError, CryptoPair, KeyUnavailableError, NoCallback
+from .dplpmtud import DplpmtudProber
 from .logger import QuicLoggerTrace
 from .packet import (
     CONNECTION_ID_MAX_SIZE,
@@ -51,7 +52,12 @@ from .packet import (
     push_ack_frame,
     push_quic_transport_parameters,
 )
-from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
+from .packet_builder import (
+    QuicDeliveryState,
+    QuicPacketBuilder,
+    QuicPacketBuilderStop,
+    QuicSentPacket,
+)
 from .recovery import QuicPacketRecovery, QuicPacketSpace
 from .stream import FinalSizeError, QuicStream, StreamFinishedError
 
@@ -333,6 +339,7 @@ class QuicConnection:
         self._local_next_stream_id_uni = 2 if self._is_client else 3
         self._loss_at: Optional[float] = None
         self._max_datagram_size = configuration.max_datagram_size
+        self._mtu_path: Optional[QuicNetworkPath] = None
         self._network_paths: list[QuicNetworkPath] = []
         self._pacing_at: Optional[float] = None
         self._packet_number = 0
@@ -351,6 +358,7 @@ class QuicConnection:
         self._remote_max_data = 0
         self._remote_max_data_used = 0
         self._remote_max_datagram_frame_size: Optional[int] = None
+        self._remote_max_udp_payload_size: Optional[int] = None
         self._remote_max_stream_data_bidi_local = 0
         self._remote_max_stream_data_bidi_remote = 0
         self._remote_max_stream_data_uni = 0
@@ -398,6 +406,11 @@ class QuicConnection:
             quic_logger=self._quic_logger,
             send_probe=self._send_probe,
             logger=self._logger,
+        )
+
+        # DPLPMTUD - RFC 9000 section 14.3
+        self._mtu = DplpmtudProber(
+            max_datagram_size=configuration.max_datagram_size, logger=self._logger
         )
 
         # things to send
@@ -532,6 +545,13 @@ class QuicConnection:
         """
         network_path = self._network_paths[0]
 
+        # DPLPMTUD: re-establish the probing state when the network path
+        # changes, for instance as the result of a migration.
+        if network_path is not self._mtu_path:
+            self._mtu_path = network_path
+            self._mtu.reset()
+            self._update_path_mtu()
+
         if self._state in END_STATES:
             return []
 
@@ -615,26 +635,7 @@ class QuicConnection:
 
                 # log packet
                 if self._quic_logger is not None:
-                    self._quic_logger.log_event(
-                        category="transport",
-                        event="packet_sent",
-                        data={
-                            "frames": packet.quic_logger_frames,
-                            "header": {
-                                "packet_number": packet.packet_number,
-                                "packet_type": self._quic_logger.packet_type(
-                                    packet.packet_type
-                                ),
-                                "scid": (
-                                    ""
-                                    if packet.packet_type == QuicPacketType.ONE_RTT
-                                    else dump_cid(self.host_cid)
-                                ),
-                                "dcid": dump_cid(self._peer_cid.cid),
-                            },
-                            "raw": {"length": packet.sent_bytes},
-                        },
-                    )
+                    self._log_packet_sent(packet)
 
             # check if we can discard initial keys
             if sent_handshake and self._is_client:
@@ -648,19 +649,70 @@ class QuicConnection:
             ret.append((datagram, network_path.addr))
 
             if self._quic_logger is not None:
-                self._quic_logger.log_event(
-                    category="transport",
-                    event="datagrams_sent",
-                    data={
-                        "count": 1,
-                        "raw": [
-                            {
-                                "length": UDP_HEADER_SIZE + payload_length,
-                                "payload_length": payload_length,
-                            }
-                        ],
-                    },
+                self._log_datagram_sent(payload_length)
+
+        # DPLPMTUD: send a probe packet if one is due, see RFC 9000
+        # section 14.3.1. The probe is a PING frame padded to the probed
+        # size, sent in its own datagram.
+        if (
+            self._state not in END_STATES
+            and self._handshake_complete
+            and network_path.is_validated
+        ):
+            probe = self._mtu.next_probe(now)
+            if probe is not None:
+                probe_id, probe_size = probe
+                self._logger.debug(
+                    "Sending MTU probe %d (%d bytes)", probe_id, probe_size
                 )
+                probe_builder = QuicPacketBuilder(
+                    host_cid=self.host_cid,
+                    is_client=self._is_client,
+                    max_datagram_size=probe_size,
+                    packet_number=self._packet_number,
+                    peer_cid=self._peer_cid.cid,
+                    peer_token=self._peer_token,
+                    quic_logger=self._quic_logger,
+                    spin_bit=self._spin_bit,
+                    version=self._version,
+                )
+                probe_builder.start_packet(
+                    QuicPacketType.ONE_RTT, self._cryptos[tls.Epoch.ONE_RTT]
+                )
+                probe_builder.start_frame(
+                    QuicFrameType.PING,
+                    capacity=PING_FRAME_CAPACITY,
+                    handler=self._on_mtu_probe_delivery,
+                    handler_args=(probe_id,),
+                )
+                if self._quic_logger is not None:
+                    probe_builder.quic_logger_frames.append(
+                        self._quic_logger.encode_ping_frame()
+                    )
+                probe_builder.pad_to_capacity()
+                probe_datagrams, probe_packets = probe_builder.flush()
+                self._packet_number = probe_builder.packet_number
+
+                for packet in probe_packets:
+                    # MTU probes are ack-eliciting but are not congestion
+                    # controlled: their loss must not trigger a congestion
+                    # control response.
+                    packet.in_flight = False
+                    packet.is_mtu_probe = True
+                    packet.sent_time = now
+                    self._loss.on_packet_sent(
+                        packet=packet, space=self._spaces[tls.Epoch.ONE_RTT]
+                    )
+                    if self._quic_logger is not None:
+                        self._log_packet_sent(packet)
+
+                for datagram in probe_datagrams:
+                    payload_length = len(datagram)
+                    network_path.bytes_sent += payload_length
+                    ret.append((datagram, network_path.addr))
+
+                    if self._quic_logger is not None:
+                        self._log_datagram_sent(payload_length)
         return ret
 
     def get_next_available_stream_id(self, is_unidirectional=False) -> int:
@@ -692,6 +744,11 @@ class QuicConnection:
             if self._pacing_at is not None and self._pacing_at < timer_at:
                 timer_at = self._pacing_at
 
+            # DPLPMTUD probe timer
+            mtu_at = self._mtu.get_timeout()
+            if mtu_at is not None and mtu_at < timer_at:
+                timer_at = mtu_at
+
         return timer_at
 
     def handle_timer(self, now: float) -> None:
@@ -717,6 +774,11 @@ class QuicConnection:
         if self._loss_at is not None and now >= self._loss_at:
             self._logger.debug("Loss detection triggered")
             self._loss.on_loss_detection_timeout(now=now)
+
+        # DPLPMTUD probe timeout
+        mtu_at = self._mtu.get_timeout()
+        if mtu_at is not None and now >= mtu_at:
+            self._mtu.on_timeout(now)
 
     def next_event(self) -> Optional[events.QuicEvent]:
         """
@@ -2343,6 +2405,41 @@ class QuicConnection:
                 data={"key_type": key_type, "trigger": trigger},
             )
 
+    def _log_datagram_sent(self, payload_length: int) -> None:
+        self._quic_logger.log_event(
+            category="transport",
+            event="datagrams_sent",
+            data={
+                "count": 1,
+                "raw": [
+                    {
+                        "length": UDP_HEADER_SIZE + payload_length,
+                        "payload_length": payload_length,
+                    }
+                ],
+            },
+        )
+
+    def _log_packet_sent(self, packet: QuicSentPacket) -> None:
+        self._quic_logger.log_event(
+            category="transport",
+            event="packet_sent",
+            data={
+                "frames": packet.quic_logger_frames,
+                "header": {
+                    "packet_number": packet.packet_number,
+                    "packet_type": self._quic_logger.packet_type(packet.packet_type),
+                    "scid": (
+                        ""
+                        if packet.packet_type == QuicPacketType.ONE_RTT
+                        else dump_cid(self.host_cid)
+                    ),
+                    "dcid": dump_cid(self._peer_cid.cid),
+                },
+                "raw": {"length": packet.sent_bytes},
+            },
+        )
+
     def _on_ack_delivery(
         self, delivery: QuicDeliveryState, space: QuicPacketSpace, highest_acked: int
     ) -> None:
@@ -2399,6 +2496,20 @@ class QuicConnection:
         else:
             self._ping_pending.extend(uids)
 
+    def _on_mtu_probe_delivery(
+        self, delivery: QuicDeliveryState, probe_id: int
+    ) -> None:
+        """
+        Callback when a DPLPMTUD probe packet is acknowledged or lost.
+        """
+        if delivery == QuicDeliveryState.ACKED:
+            self._logger.debug("MTU probe %d acknowledged", probe_id)
+            self._mtu.on_probe_acked(probe_id)
+        else:
+            self._logger.debug("MTU probe %d lost", probe_id)
+            self._mtu.on_probe_lost(probe_id)
+        self._update_path_mtu()
+
     def _on_retire_connection_id_delivery(
         self, delivery: QuicDeliveryState, sequence_number: int
     ) -> None:
@@ -2407,6 +2518,19 @@ class QuicConnection:
         """
         if delivery != QuicDeliveryState.ACKED:
             self._retire_connection_ids.append(sequence_number)
+
+    def _update_path_mtu(self) -> None:
+        """
+        Update the maximum datagram size used for sending to the size
+        validated by DPLPMTUD.
+        """
+        if self._mtu.plpmtu != self._max_datagram_size:
+            self._logger.info(
+                "Path max datagram size updated: %d -> %d",
+                self._max_datagram_size,
+                self._mtu.plpmtu,
+            )
+            self._max_datagram_size = self._mtu.plpmtu
 
     def _payload_received(
         self,
@@ -2855,6 +2979,18 @@ class QuicConnection:
         self._remote_max_datagram_frame_size = (
             quic_transport_parameters.max_datagram_frame_size
         )
+        if quic_transport_parameters.max_udp_payload_size is not None:
+            self._remote_max_udp_payload_size = (
+                quic_transport_parameters.max_udp_payload_size
+            )
+            # DPLPMTUD probes are bounded by what the peer is willing to
+            # receive, see RFC 9000 section 18.2.
+            self._mtu.set_ceiling(
+                min(
+                    self._configuration.max_datagram_size,
+                    self._remote_max_udp_payload_size,
+                )
+            )
         for param in [
             "max_data",
             "max_stream_data_bidi_local",

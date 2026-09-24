@@ -38,6 +38,8 @@ class QuicSentPacket:
     packet_type: QuicPacketType
     sent_time: Optional[float] = None
     sent_bytes: int = 0
+    # whether this packet is a DPLPMTUD probe (RFC 9000 section 14.3.1)
+    is_mtu_probe: bool = False
 
     delivery_handlers: list[tuple[QuicDeliveryHandler, Any]] = field(
         default_factory=list
@@ -153,6 +155,14 @@ class QuicPacketBuilder:
         self._datagrams = []
         self._packets = []
         return datagrams, packets
+
+    def pad_to_capacity(self) -> None:
+        """
+        Pad the current datagram to the buffer capacity.
+
+        This is used to build DPLPMTUD probe packets of a specific size.
+        """
+        self._datagram_needs_padding = True
 
     def start_frame(
         self,

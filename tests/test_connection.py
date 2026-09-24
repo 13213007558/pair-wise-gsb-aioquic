@@ -436,8 +436,9 @@ class QuicConnectionTest(TestCase):
 
     def test_connect_with_custom_packet_size(self):
         """
-        Check that the size of the initial QUIC packet corresponds to the
-        packet size configuration.
+        Check that the size of the initial QUIC packet is limited to the
+        base size, the configured packet size is only used as the ceiling
+        for DPLPMTUD probes.
         """
 
         client_configuration = QuicConfiguration(is_client=True, max_datagram_size=1480)
@@ -448,7 +449,7 @@ class QuicConnectionTest(TestCase):
         now = 0.0
         client.connect(SERVER_ADDR, now=now)
         items = client.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1480])
+        self.assertEqual(datagram_sizes(items), [SMALLEST_MAX_DATAGRAM_SIZE])
 
     def test_connect_without_loss(self):
         """

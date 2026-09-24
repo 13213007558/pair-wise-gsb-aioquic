@@ -268,10 +268,8 @@ class QuicPacketRecovery:
 
         if packet.is_ack_eliciting:
             space.ack_eliciting_in_flight += 1
+            self._time_of_last_sent_ack_eliciting_packet = packet.sent_time
         if packet.in_flight:
-            if packet.is_ack_eliciting:
-                self._time_of_last_sent_ack_eliciting_packet = packet.sent_time
-
             # add packet to bytes in flight
             self._cc.on_packet_sent(packet=packet)
 
