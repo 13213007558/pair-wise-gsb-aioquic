@@ -51,12 +51,26 @@ class QuicLoggerTrace:
 
     # QUIC
 
-    def encode_ack_frame(self, ranges: RangeSet, delay: float) -> dict:
-        return {
+    def encode_ack_frame(
+        self,
+        ranges: RangeSet,
+        delay: float,
+        ecn_counts: Optional[tuple[int, int, int]] = None,
+    ) -> dict:
+        frame = {
             "ack_delay": self.encode_time(delay),
             "acked_ranges": [[x.start, x.stop - 1] for x in ranges],
             "frame_type": "ack",
         }
+        if ecn_counts is not None:
+            frame.update(
+                {
+                    "ect0": ecn_counts[0],
+                    "ect1": ecn_counts[1],
+                    "ce": ecn_counts[2],
+                }
+            )
+        return frame
 
     def encode_connection_close_frame(
         self, error_code: int, frame_type: Optional[int], reason_phrase: str

@@ -24,6 +24,12 @@ class QuicCongestionControl(abc.ABC):
     def on_packet_acked(self, *, now: float, packet: QuicSentPacket) -> None: ...
 
     @abc.abstractmethod
+    def on_congestion_event(self, *, now: float, largest_sent_time: float) -> None:
+        """
+        Handle a congestion event signalled via ECN CE marks.
+        """
+
+    @abc.abstractmethod
     def on_packet_sent(self, *, packet: QuicSentPacket) -> None: ...
 
     @abc.abstractmethod

@@ -118,7 +118,9 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._transmit_task = None
 
         # send datagrams
-        for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
+        # NOTE: the ECN marking returned by `datagrams_to_send` is not applied
+        # here, as setting the ECN bits on a socket is platform-specific.
+        for data, addr, ecn in self._quic.datagrams_to_send(now=self._loop.time()):
             self._transport.sendto(data, addr)
 
         # re-arm timer

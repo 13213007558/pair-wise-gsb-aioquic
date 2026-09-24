@@ -24,6 +24,17 @@ RETRY_INTEGRITY_TAG_SIZE = 16
 STATELESS_RESET_TOKEN_SIZE = 16
 
 
+class QuicEcnMarking(IntEnum):
+    """
+    The ECN marking of an IP packet, as found in the Traffic Class field.
+    """
+
+    NOT_ECT = 0
+    ECT_1 = 1
+    ECT_0 = 2
+    CE = 3
+
+
 class QuicErrorCode(IntEnum):
     NO_ERROR = 0x0
     INTERNAL_ERROR = 0x1

@@ -11,6 +11,7 @@ from .packet import (
     NON_IN_FLIGHT_FRAME_TYPES,
     PACKET_FIXED_BIT,
     PACKET_NUMBER_MAX_SIZE,
+    QuicEcnMarking,
     QuicFrameType,
     QuicPacketType,
     encode_long_header_first_byte,
@@ -36,6 +37,7 @@ class QuicSentPacket:
     is_crypto_packet: bool
     packet_number: int
     packet_type: QuicPacketType
+    ecn_marking: QuicEcnMarking = QuicEcnMarking.NOT_ECT
     sent_time: Optional[float] = None
     sent_bytes: int = 0
 

@@ -157,6 +157,34 @@ class CubicCongestionControl(QuicCongestionControl):
         for packet in packets:
             self.bytes_in_flight -= packet.sent_bytes
 
+    def on_congestion_event(self, *, now: float, largest_sent_time: float) -> None:
+        # start a new congestion event if the packet was sent after the
+        # start of the previous congestion recovery period.
+        if largest_sent_time > self._congestion_recovery_start_time:
+            self._congestion_recovery_start_time = now
+
+            # fast convergence
+            if self._W_max is not None and self.congestion_window < self._W_max:
+                self._W_max = int(
+                    self.congestion_window * (1 + K_CUBIC_LOSS_REDUCTION_FACTOR) / 2
+                )
+            else:
+                self._W_max = self.congestion_window
+
+            # normal congestion MD
+            flight_size = self.bytes_in_flight
+            new_ssthresh = max(
+                int(flight_size * K_CUBIC_LOSS_REDUCTION_FACTOR),
+                K_MINIMUM_WINDOW * self._max_datagram_size,
+            )
+            self.ssthresh = new_ssthresh
+            self.congestion_window = max(
+                self.ssthresh, K_MINIMUM_WINDOW * self._max_datagram_size
+            )
+
+            # restart a new congestion avoidance phase
+            self._starting_congestion_avoidance = True
+
     def on_packets_lost(self, *, now: float, packets: Iterable[QuicSentPacket]) -> None:
         lost_largest_time = 0.0
         for packet in packets:

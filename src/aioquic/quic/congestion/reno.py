@@ -44,6 +44,17 @@ class RenoCongestionControl(QuicCongestionControl):
     def on_packet_sent(self, *, packet: QuicSentPacket) -> None:
         self.bytes_in_flight += packet.sent_bytes
 
+    def on_congestion_event(self, *, now: float, largest_sent_time: float) -> None:
+        # start a new congestion event if the packet was sent after the
+        # start of the previous congestion recovery period.
+        if largest_sent_time > self._congestion_recovery_start_time:
+            self._congestion_recovery_start_time = now
+            self.congestion_window = max(
+                int(self.congestion_window * K_LOSS_REDUCTION_FACTOR),
+                K_MINIMUM_WINDOW * self._max_datagram_size,
+            )
+            self.ssthresh = self.congestion_window
+
     def on_packets_expired(self, *, packets: Iterable[QuicSentPacket]) -> None:
         for packet in packets:
             self.bytes_in_flight -= packet.sent_bytes

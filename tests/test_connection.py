@@ -23,6 +23,7 @@ from aioquic.quic.connection import (
 from aioquic.quic.crypto import CryptoPair
 from aioquic.quic.logger import QuicLogger
 from aioquic.quic.packet import (
+    QuicEcnMarking,
     QuicErrorCode,
     QuicFrameType,
     QuicPacketType,
@@ -242,9 +243,9 @@ def transfer(sender, receiver):
     """
     datagrams = 0
     from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
-    for data, addr in sender.datagrams_to_send(now=time.time()):
+    for data, addr, ecn in sender.datagrams_to_send(now=time.time()):
         datagrams += 1
-        receiver.receive_datagram(data, from_addr, now=time.time())
+        receiver.receive_datagram(data, from_addr, now=time.time(), ecn=ecn)
     return datagrams
 
 
@@ -1272,7 +1273,7 @@ class QuicConnectionTest(TestCase):
 
             # server sends close
             server.close(error_code=QuicErrorCode.NO_ERROR)
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
 
     def test_tls_error(self):
@@ -1430,6 +1431,198 @@ class QuicConnectionTest(TestCase):
             QuicFrameType.ACK_ECN,
             Buffer(data=b"\x00\x02\x00\x00\x00\x00\x00"),
         )
+
+    def test_ecn_counters_and_ack_ecn(self):
+        """
+        ECN markings of received datagrams are counted per packet number
+        space and reported to the peer in ACK_ECN frames.
+        """
+        with client_and_server() as (client, server):
+            self.assertTrue(client._loss.ecn_enabled)
+            self.assertTrue(client._network_paths[0].ecn_enabled)
+
+            # outgoing datagrams are marked ECT(0)
+            client.send_ping(uid=1)
+            items = client.datagrams_to_send(now=time.time())
+            self.assertEqual(items[0][2], QuicEcnMarking.ECT_0)
+            for data, addr, ecn in items:
+                server.receive_datagram(data, CLIENT_ADDR, now=time.time(), ecn=ecn)
+
+            # the server counted the marked packets in the 1-RTT space
+            server_counters = server._spaces[tls.Epoch.ONE_RTT].ecn_counters
+            self.assertGreaterEqual(server_counters[QuicEcnMarking.ECT_0], 1)
+
+            # the server sends an ACK_ECN frame with its cumulative counts
+            self.assertEqual(transfer(server, client), 1)
+            client_space = client._spaces[tls.Epoch.ONE_RTT]
+            self.assertEqual(
+                client_space.ecn_counts_acked,
+                [
+                    server_counters[QuicEcnMarking.ECT_0],
+                    server_counters[QuicEcnMarking.ECT_1],
+                    server_counters[QuicEcnMarking.CE],
+                ],
+            )
+
+            # the frame was logged with its ECN counts
+            log = server.configuration.quic_logger.to_dict()
+            found = False
+            for event in log["traces"][0]["events"]:
+                if event["name"] == "transport:packet_sent":
+                    for frame in event["data"]["frames"]:
+                        if frame["frame_type"] == "ack" and "ect0" in frame:
+                            found = True
+            self.assertTrue(found)
+
+    def test_ecn_ce_marks_trigger_congestion(self):
+        """
+        CE marks reported by the peer trigger a congestion response, but
+        duplicate ACK frames do not trigger it again.
+        """
+        with client_and_server() as (client, server):
+            congestion_events = []
+            on_congestion_event = client._loss._cc.on_congestion_event
+
+            def spy(**kwargs):
+                congestion_events.append(kwargs)
+                return on_congestion_event(**kwargs)
+
+            client._loss._cc.on_congestion_event = spy
+            congestion_window = client._loss.congestion_window
+
+            # client sends a PING, the in-memory link marks the datagram CE
+            client.send_ping(uid=1)
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
+                server.receive_datagram(
+                    data, CLIENT_ADDR, now=time.time(), ecn=QuicEcnMarking.CE
+                )
+
+            # the server reports the CE mark, the client reacts to congestion
+            ack_datagrams = [
+                data for data, addr, ecn in server.datagrams_to_send(now=time.time())
+            ]
+            self.assertEqual(len(ack_datagrams), 1)
+            for data in ack_datagrams:
+                client.receive_datagram(
+                    data, SERVER_ADDR, now=time.time(), ecn=QuicEcnMarking.ECT_0
+                )
+            self.assertEqual(len(congestion_events), 1)
+            self.assertLess(client._loss.congestion_window, congestion_window)
+
+            # a duplicate ACK does not trigger another congestion response
+            for data in ack_datagrams:
+                client.receive_datagram(
+                    data, SERVER_ADDR, now=time.time(), ecn=QuicEcnMarking.ECT_0
+                )
+            self.assertEqual(len(congestion_events), 1)
+            self.assertTrue(client._loss.ecn_enabled)
+
+    def test_ecn_reordered_ack_not_double_counted(self):
+        """
+        A reordered ACK frame does not trigger another congestion response
+        and does not disable ECN.
+        """
+        with client_and_server() as (client, server):
+            congestion_events = []
+            on_congestion_event = client._loss._cc.on_congestion_event
+
+            def spy(**kwargs):
+                congestion_events.append(kwargs)
+                return on_congestion_event(**kwargs)
+
+            client._loss._cc.on_congestion_event = spy
+
+            # two PINGs, each marked CE by the in-memory link
+            ack_datagrams = []
+            for uid in [1, 2]:
+                client.send_ping(uid=uid)
+                for data, addr, ecn in client.datagrams_to_send(now=time.time()):
+                    server.receive_datagram(
+                        data, CLIENT_ADDR, now=time.time(), ecn=QuicEcnMarking.CE
+                    )
+                ack_datagrams.append(
+                    [
+                        data
+                        for data, addr, ecn in server.datagrams_to_send(now=time.time())
+                    ]
+                )
+
+            # deliver the ACKs out of order: a single congestion response
+            for data in ack_datagrams[1] + ack_datagrams[0]:
+                client.receive_datagram(
+                    data, SERVER_ADDR, now=time.time(), ecn=QuicEcnMarking.ECT_0
+                )
+            self.assertEqual(len(congestion_events), 1)
+            self.assertTrue(client._loss.ecn_enabled)
+
+    def test_ecn_counts_regression_disables_ecn(self):
+        """
+        If the peer's ECN counts go backwards, ECN is disabled on the path
+        while ACK processing and loss recovery keep working.
+        """
+        with client_and_server() as (client, server):
+            client_space = client._spaces[tls.Epoch.ONE_RTT]
+            server_space = server._spaces[tls.Epoch.ONE_RTT]
+
+            # exchange a PING so the client holds ECN counts from the peer
+            client.send_ping(uid=1)
+            self.assertEqual(roundtrip(client, server), (1, 1))
+            stored_ect0 = client_space.ecn_counts_acked[0]
+            self.assertGreaterEqual(stored_ect0, 2)
+
+            # the peer now reports counts lower than before
+            client.send_ping(uid=2)
+            self.assertEqual(transfer(client, server), 1)
+            server_space.ecn_counters[QuicEcnMarking.ECT_0] = stored_ect0 - 1
+            self.assertEqual(transfer(server, client), 1)
+
+            # ECN is disabled on the path and datagrams are no longer marked
+            self.assertFalse(client._loss.ecn_enabled)
+            self.assertFalse(client._network_paths[0].ecn_enabled)
+            client.send_ping(uid=3)
+            items = client.datagrams_to_send(now=time.time())
+            self.assertEqual(items[0][2], QuicEcnMarking.NOT_ECT)
+            for data, addr, ecn in items:
+                server.receive_datagram(data, CLIENT_ADDR, now=time.time(), ecn=ecn)
+
+            # normal ACK processing keeps working
+            self.assertEqual(transfer(server, client), 1)
+            self.assertEqual(client_space.sent_packets, {})
+
+            # loss recovery keeps working
+            consume_events(client)
+            client.send_ping(uid=4)
+            self.assertEqual(drop(client), 1)
+            client._on_ping_delivery(QuicDeliveryState.LOST, (4,))
+            self.assertEqual(roundtrip(client, server), (1, 1))
+            event = client.next_event()
+            self.assertEqual(type(event), events.PingAcknowledged)
+            self.assertEqual(event.uid, 4)
+
+    def test_ecn_forged_counts_disable_ecn(self):
+        """
+        If the peer reports more CE marks than the number of ECT-marked
+        packets sent, ECN is disabled on the path.
+        """
+        with client_and_server() as (client, server):
+            client.send_ping(uid=1)
+            self.assertEqual(transfer(client, server), 1)
+
+            # the peer reports more CE marks than ECT-marked packets sent
+            sent_ect0 = client._spaces[tls.Epoch.ONE_RTT].ecn_marks_sent[
+                QuicEcnMarking.ECT_0
+            ]
+            server._spaces[tls.Epoch.ONE_RTT].ecn_counters[QuicEcnMarking.CE] = (
+                sent_ect0 + 1
+            )
+            self.assertEqual(transfer(server, client), 1)
+
+            # ECN is disabled on the path and datagrams are no longer marked
+            self.assertFalse(client._loss.ecn_enabled)
+            self.assertFalse(client._network_paths[0].ecn_enabled)
+            client.send_ping(uid=2)
+            items = client.datagrams_to_send(now=time.time())
+            self.assertEqual(items[0][2], QuicEcnMarking.NOT_ECT)
 
     def test_handle_connection_close_frame(self):
         with client_and_server() as (client, server):
@@ -1949,7 +2142,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server() as (client, server):
             # client changes address and sends some data
             client.send_stream_data(0, b"01234567")
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1960,9 +2153,9 @@ class QuicConnectionTest(TestCase):
             self.assertTrue(server._network_paths[1].is_validated)
 
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1975,7 +2168,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server() as (client, server):
             # client changes address and sends some data
             client.send_stream_data(0, b"01234567")
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1987,9 +2180,9 @@ class QuicConnectionTest(TestCase):
 
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE on the 1234
             # path instead of the expected 2345 path.
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 1234), now=time.time())
 
             # check paths; note that the order is backwards from the prior test
