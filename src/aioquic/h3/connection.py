@@ -7,8 +7,15 @@ from typing import FrozenSet, Optional, Set
 
 import pylsqpack
 from aioquic.buffer import UINT_VAR_MAX_SIZE, Buffer, BufferReadError, encode_uint_var
+from aioquic.h3.capsule import (
+    CapsuleError,
+    CapsuleParser,
+    CapsuleType,
+    encode_capsule,
+)
 from aioquic.h3.events import (
     DatagramReceived,
+    DatagramTransport,
     DataReceived,
     H3Event,
     Headers,
@@ -202,6 +209,14 @@ def stream_is_request_response(stream_id: int):
     return stream_id % 4 == 0
 
 
+def headers_include_capsule_protocol(headers: Headers) -> bool:
+    """
+    Returns True if the headers indicate use of the capsule protocol,
+    as described in RFC 9297 section 3.4.
+    """
+    return (b"capsule-protocol", b"?1") in headers
+
+
 def validate_header_name(key: bytes) -> None:
     """
     Validate a header name as specified by RFC 9113 section 8.2.1.
@@ -347,6 +362,8 @@ class H3Stream:
         self.blocked = False
         self.blocked_frame_size: Optional[int] = None
         self.buffer = b""
+        self.capsule_parser: Optional[CapsuleParser] = None
+        self.capsule_protocol = False
         self.receiving_ended = False
         self.sending_ended = False
         self.frame_size: Optional[int] = None
@@ -459,9 +476,21 @@ class H3Connection:
 
         return []
 
-    def send_datagram(self, stream_id: int, data: bytes) -> None:
+    def send_datagram(
+        self,
+        stream_id: int,
+        data: bytes,
+        transport: DatagramTransport = DatagramTransport.QUIC_DATAGRAM,
+    ) -> None:
         """
         Send a datagram for the specified stream.
+
+        The application explicitly chooses the transport: by default the
+        datagram is sent unreliably in a QUIC DATAGRAM frame. If
+        :attr:`~aioquic.h3.events.DatagramTransport.CAPSULE` is used, the
+        datagram is sent reliably as a DATAGRAM capsule (RFC 9297) within
+        the request stream. A single datagram is only ever sent once, over
+        the selected transport.
 
         If the stream ID is not a client-initiated bidirectional stream, an
         :class:`~aioquic.h3.exceptions.InvalidStreamTypeError` exception is raised.
@@ -470,6 +499,7 @@ class H3Connection:
 
         :param stream_id: The stream ID.
         :param data: The HTTP/3 datagram payload.
+        :param transport: The transport used to carry the datagram.
         """
 
         # check stream ID is valid
@@ -478,7 +508,22 @@ class H3Connection:
                 "Datagrams can only be sent for client-initiated bidirectional streams"
             )
 
-        self._quic.send_datagram_frame(encode_uint_var(stream_id // 4) + data)
+        if transport is DatagramTransport.CAPSULE:
+            # check the capsule protocol was negotiated for this stream
+            with self._get_or_create_stream(stream_id) as stream:
+                if not stream.capsule_protocol:
+                    raise FrameUnexpected(
+                        "The capsule protocol was not negotiated for this stream"
+                    )
+
+            # send the DATAGRAM capsule reliably within the request stream
+            self.send_data(
+                stream_id,
+                encode_capsule(CapsuleType.DATAGRAM, data),
+                end_stream=False,
+            )
+        else:
+            self._quic.send_datagram_frame(encode_uint_var(stream_id // 4) + data)
 
     def send_push_promise(self, stream_id: int, headers: Headers) -> int:
         """
@@ -592,6 +637,8 @@ class H3Connection:
             # update state and send headers
             if stream.headers_send_state == HeadersState.INITIAL:
                 stream.headers_send_state = HeadersState.AFTER_HEADERS
+                if headers_include_capsule_protocol(headers):
+                    stream.capsule_protocol = True
             else:
                 stream.headers_send_state = HeadersState.AFTER_TRAILERS
             self._quic.send_stream_data(
@@ -717,6 +764,35 @@ class H3Connection:
         ):
             raise MessageError("content-length does not match data size")
 
+    def _check_capsule_stream_end(self, stream: H3Stream) -> None:
+        """
+        Check no capsule was truncated when the stream carrying it ended.
+        """
+        if stream.capsule_parser is not None:
+            try:
+                stream.capsule_parser.finalize()
+            except CapsuleError as exc:
+                raise MessageError(str(exc)) from exc
+
+    def _handle_capsule_data(self, stream: H3Stream, data: bytes) -> list[H3Event]:
+        """
+        Feed DATA frame payload to the capsule parser and emit events for
+        complete capsules.
+        """
+        http_events: list[H3Event] = []
+        for capsule_type, capsule_value in stream.capsule_parser.feed_data(data):
+            if capsule_type == CapsuleType.DATAGRAM:
+                # the DATAGRAM capsule is associated with the current request,
+                # its value is the datagram payload
+                http_events.append(
+                    DatagramReceived(
+                        data=capsule_value,
+                        stream_id=stream.stream_id,
+                        transport=DatagramTransport.CAPSULE,
+                    )
+                )
+        return http_events
+
     def _handle_request_or_push_frame(
         self,
         frame_type: int,
@@ -740,7 +816,11 @@ class H3Connection:
             if stream_ended:
                 self._check_content_length(stream)
 
-            if stream_ended or frame_data:
+            if stream.capsule_parser is not None:
+                # the capsule protocol was negotiated, DATA frames carry capsules
+                if frame_data:
+                    http_events.extend(self._handle_capsule_data(stream, frame_data))
+            elif stream_ended or frame_data:
                 http_events.append(
                     DataReceived(
                         data=frame_data,
@@ -789,6 +869,10 @@ class H3Connection:
             # update state and emit headers
             if stream.headers_recv_state == HeadersState.INITIAL:
                 stream.headers_recv_state = HeadersState.AFTER_HEADERS
+                if headers_include_capsule_protocol(headers):
+                    # the capsule protocol was negotiated, parse capsules
+                    stream.capsule_protocol = True
+                    stream.capsule_parser = CapsuleParser()
             else:
                 stream.headers_recv_state = HeadersState.AFTER_TRAILERS
             http_events.append(
@@ -953,14 +1037,20 @@ class H3Connection:
             and len(stream.buffer) < stream.frame_size
         ):
             stream.content_length += len(stream.buffer)
-            http_events.append(
-                DataReceived(
-                    data=stream.buffer,
-                    push_id=stream.push_id,
-                    stream_id=stream.stream_id,
-                    stream_ended=False,
+            if stream.capsule_parser is not None:
+                # the capsule protocol was negotiated, DATA frames carry capsules
+                http_events.extend(self._handle_capsule_data(stream, stream.buffer))
+                if stream_ended:
+                    self._check_capsule_stream_end(stream)
+            else:
+                http_events.append(
+                    DataReceived(
+                        data=stream.buffer,
+                        push_id=stream.push_id,
+                        stream_id=stream.stream_id,
+                        stream_ended=False,
+                    )
                 )
-            )
             stream.frame_size -= len(stream.buffer)
             stream.buffer = b""
             return http_events
@@ -968,6 +1058,10 @@ class H3Connection:
         # handle lone FIN
         if stream_ended and not stream.buffer:
             self._check_content_length(stream)
+
+            if stream.capsule_parser is not None:
+                self._check_capsule_stream_end(stream)
+                return http_events
 
             http_events.append(
                 DataReceived(
@@ -1060,6 +1154,10 @@ class H3Connection:
 
         # remove processed data from buffer
         stream.buffer = stream.buffer[consumed:]
+
+        # check for truncated capsules when the stream ends
+        if stream_ended:
+            self._check_capsule_stream_end(stream)
 
         return http_events
 
