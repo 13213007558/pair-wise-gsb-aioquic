@@ -11,6 +11,7 @@ from aioquic.quic import events
 from aioquic.quic.configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
 from aioquic.quic.connection import (
     MAX_LOCAL_CHALLENGES,
+    MAX_PATH_PROBE_ATTEMPTS,
     MAX_PENDING_CRYPTO,
     MAX_REMOTE_CHALLENGES,
     STREAM_COUNT_MAX,
@@ -18,6 +19,7 @@ from aioquic.quic.connection import (
     QuicConnection,
     QuicConnectionError,
     QuicNetworkPath,
+    QuicPathValidationState,
     QuicReceiveContext,
 )
 from aioquic.quic.crypto import CryptoPair
@@ -48,6 +50,8 @@ CLIENT_ADDR = ("1.2.3.4", 1234)
 CLIENT_HANDSHAKE_DATAGRAM_SIZES = [1200]
 
 SERVER_ADDR = ("2.3.4.5", 4433)
+SERVER_ADDR_B = ("2.3.4.5", 4444)
+SERVER_ADDR_C = ("2.3.4.5", 4455)
 SERVER_INITIAL_DATAGRAM_SIZES = [1200, 1162]
 
 HANDSHAKE_COMPLETED_EVENTS = [
@@ -2037,6 +2041,206 @@ class QuicConnectionTest(TestCase):
                 )
             self.assertEqual(cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION)
             self.assertEqual(cm.exception.frame_type, QuicFrameType.PATH_RESPONSE)
+
+    def test_validate_path_and_switch(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # delay ACKs so the PATH_RESPONSE is not coalesced with an ACK,
+            # which would make the packet non-probing
+            server._ack_delay = 1000
+
+            # client starts validating a new server address
+            client.validate_path(SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+
+            # application data still goes to the current path, only a padded
+            # probe goes to the new path
+            client.send_stream_data(0, b"01234567")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(
+                [addr for data, addr in items], [SERVER_ADDR, SERVER_ADDR_B]
+            )
+            self.assertEqual(len(items[1][0]), SMALLEST_MAX_DATAGRAM_SIZE)
+
+            # deliver application data and the probe to the server
+            for data, addr in items:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # server received the stream data on the original path
+            event = None
+            while True:
+                event = server.next_event()
+                if event is None or isinstance(event, events.StreamDataReceived):
+                    break
+            self.assertIsNotNone(event)
+            self.assertEqual(event.stream_id, 0)
+            self.assertEqual(event.data, b"01234567")
+
+            # server sends PATH_RESPONSE, delivered from the probed address
+            for data, addr in server.datagrams_to_send(now=now):
+                client.receive_datagram(data, SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.VALIDATED,
+            )
+
+            # no switch happened yet, data still goes to the current path
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR)
+
+            # explicit switch, data now goes to the new path
+            client.switch_path(SERVER_ADDR_B)
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR_B)
+
+            client.send_stream_data(0, b"WXYZ")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual([addr for data, addr in items], [SERVER_ADDR_B])
+            for data, addr in items:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # the stream continues uninterrupted on the new path
+            event = None
+            while True:
+                event = server.next_event()
+                if event is None or isinstance(event, events.StreamDataReceived):
+                    break
+            self.assertIsNotNone(event)
+            self.assertEqual(event.stream_id, 0)
+            self.assertEqual(event.data, b"WXYZ")
+
+            # server can send data back, received by the client on the new path
+            server.send_stream_data(0, b"reply")
+            for data, addr in server.datagrams_to_send(now=now):
+                client.receive_datagram(data, SERVER_ADDR_B, now=now)
+            event = None
+            while True:
+                event = client.next_event()
+                if event is None or isinstance(event, events.StreamDataReceived):
+                    break
+            self.assertIsNotNone(event)
+            self.assertEqual(event.stream_id, 0)
+            self.assertEqual(event.data, b"reply")
+
+    def test_validate_path_response_from_wrong_address(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # delay ACKs so the PATH_RESPONSE is not coalesced with an ACK
+            server._ack_delay = 1000
+
+            # client starts validating a new server address
+            client.validate_path(SERVER_ADDR_B, now=now)
+
+            # send the challenge to the server
+            for data, addr in client.datagrams_to_send(now=now):
+                self.assertEqual(addr, SERVER_ADDR_B)
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # get the server's PATH_RESPONSE
+            responses = [data for data, addr in server.datagrams_to_send(now=now)]
+            self.assertEqual(len(responses), 1)
+
+            # a response echoing the same bytes from a different address must
+            # not validate the probed path
+            client.receive_datagram(responses[0], SERVER_ADDR_C, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR)
+
+            # the same response from the probed address validates the path
+            client.receive_datagram(responses[0], SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.VALIDATED,
+            )
+
+    def test_validate_path_timeout(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # client starts validating a new server address
+            client.validate_path(SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+
+            # the challenge is retransmitted, then validation fails
+            pto = client._loss.get_probe_timeout()
+            for attempt in range(MAX_PATH_PROBE_ATTEMPTS):
+                items = client.datagrams_to_send(now=now)
+                self.assertEqual([addr for data, addr in items], [SERVER_ADDR_B])
+                now += pto
+                client.handle_timer(now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.FAILED,
+            )
+
+            # no more probes are sent and the current path keeps serving data
+            client.send_stream_data(0, b"01234567")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual([addr for data, addr in items], [SERVER_ADDR])
+            for data, addr in items:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            event = None
+            while True:
+                event = server.next_event()
+                if event is None or isinstance(event, events.StreamDataReceived):
+                    break
+            self.assertIsNotNone(event)
+            self.assertEqual(event.stream_id, 0)
+            self.assertEqual(event.data, b"01234567")
+
+    def test_validate_path_cancel(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # client starts then cancels validation of a new server address
+            client.validate_path(SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+            client.cancel_path_validation(SERVER_ADDR_B)
+            self.assertIsNone(client.path_validation_state(SERVER_ADDR_B))
+
+            # no probe is sent, data flows on the current path
+            client.send_stream_data(0, b"01234567")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual([addr for data, addr in items], [SERVER_ADDR])
+
+            # cancelling again raises
+            with self.assertRaises(ValueError):
+                client.cancel_path_validation(SERVER_ADDR_B)
+
+    def test_validate_path_bad_usage(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # cannot validate the current path
+            with self.assertRaises(ValueError):
+                client.validate_path(SERVER_ADDR, now=now)
+
+            # cannot switch to a path which was not validated
+            with self.assertRaises(ValueError):
+                client.switch_path(SERVER_ADDR_B)
+
+            # cannot validate the same path twice
+            client.validate_path(SERVER_ADDR_B, now=now)
+            with self.assertRaises(ValueError):
+                client.validate_path(SERVER_ADDR_B, now=now)
+
+    def test_validate_path_before_handshake(self):
+        client = create_standalone_client(self)
+        with self.assertRaises(AssertionError):
+            client.validate_path(SERVER_ADDR_B, now=time.time())
 
     def test_handle_padding_frame(self):
         client = create_standalone_client(self)

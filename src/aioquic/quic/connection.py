@@ -51,7 +51,12 @@ from .packet import (
     push_ack_frame,
     push_quic_transport_parameters,
 )
-from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
+from .packet_builder import (
+    QuicDeliveryState,
+    QuicPacketBuilder,
+    QuicPacketBuilderStop,
+    QuicSentPacket,
+)
 from .recovery import QuicPacketRecovery, QuicPacketSpace
 from .stream import FinalSizeError, QuicStream, StreamFinishedError
 
@@ -67,6 +72,7 @@ EPOCH_SHORTCUTS = {
 MAX_EARLY_DATA = 0xFFFFFFFF
 MAX_REMOTE_CHALLENGES = 32
 MAX_LOCAL_CHALLENGES = 5
+MAX_PATH_PROBE_ATTEMPTS = 3
 SECRETS_LABELS = [
     [
         None,
@@ -196,6 +202,12 @@ class QuicConnectionState(Enum):
     TERMINATED = 4
 
 
+class QuicPathValidationState(Enum):
+    PENDING = 0
+    VALIDATED = 1
+    FAILED = 2
+
+
 class QuicNetworkPath:
     def __init__(self, addr: NetworkAddress, is_validated: bool = False):
         self.addr: NetworkAddress = addr
@@ -207,6 +219,26 @@ class QuicNetworkPath:
 
     def can_send(self, size: int) -> bool:
         return self.is_validated or (self.bytes_sent + size) <= 3 * self.bytes_received
+
+
+class QuicPathProbe:
+    """
+    Tracks an actively-initiated path validation towards a new address.
+    """
+
+    def __init__(
+        self,
+        network_path: QuicNetworkPath,
+        challenge: bytes,
+        now: float,
+        timeout: float,
+    ):
+        self.network_path = network_path
+        self.challenge = challenge
+        self.state = QuicPathValidationState.PENDING
+        self.attempts = 1
+        self.challenge_pending = True
+        self.timeout_at = now + timeout
 
 
 @dataclass
@@ -336,6 +368,7 @@ class QuicConnection:
         self._network_paths: list[QuicNetworkPath] = []
         self._pacing_at: Optional[float] = None
         self._packet_number = 0
+        self._path_probes: dict[NetworkAddress, QuicPathProbe] = {}
         self._peer_cid = QuicConnectionId(
             cid=os.urandom(configuration.connection_id_length), sequence_number=None
         )
@@ -472,6 +505,21 @@ class QuicConnection:
 
             # assign new CID
             self._consume_peer_cid()
+
+    def cancel_path_validation(self, addr: NetworkAddress) -> None:
+        """
+        Cancel an ongoing path validation towards the given address.
+
+        The current network path is unaffected and keeps serving data.
+
+        :param addr: The network address of the remote peer.
+        """
+        probe = self._path_probes.get(addr)
+        if probe is None or probe.state != QuicPathValidationState.PENDING:
+            raise ValueError("No path validation in progress for this address")
+
+        self._logger.debug("Cancelling validation of network path %s", addr)
+        del self._path_probes[addr]
 
     def close(
         self,
@@ -614,27 +662,7 @@ class QuicConnection:
                     sent_handshake = True
 
                 # log packet
-                if self._quic_logger is not None:
-                    self._quic_logger.log_event(
-                        category="transport",
-                        event="packet_sent",
-                        data={
-                            "frames": packet.quic_logger_frames,
-                            "header": {
-                                "packet_number": packet.packet_number,
-                                "packet_type": self._quic_logger.packet_type(
-                                    packet.packet_type
-                                ),
-                                "scid": (
-                                    ""
-                                    if packet.packet_type == QuicPacketType.ONE_RTT
-                                    else dump_cid(self.host_cid)
-                                ),
-                                "dcid": dump_cid(self._peer_cid.cid),
-                            },
-                            "raw": {"length": packet.sent_bytes},
-                        },
-                    )
+                self._log_packet_sent(packet)
 
             # check if we can discard initial keys
             if sent_handshake and self._is_client:
@@ -646,21 +674,20 @@ class QuicConnection:
             payload_length = len(datagram)
             network_path.bytes_sent += payload_length
             ret.append((datagram, network_path.addr))
+            self._log_datagram_sent(payload_length)
 
-            if self._quic_logger is not None:
-                self._quic_logger.log_event(
-                    category="transport",
-                    event="datagrams_sent",
-                    data={
-                        "count": 1,
-                        "raw": [
-                            {
-                                "length": UDP_HEADER_SIZE + payload_length,
-                                "payload_length": payload_length,
-                            }
-                        ],
-                    },
-                )
+        # active path validation probes: only protocol probes are sent on
+        # the new paths, application data keeps flowing on the current path
+        if not self._close_pending:
+            for probe in self._path_probes.values():
+                if (
+                    probe.state != QuicPathValidationState.PENDING
+                    or not probe.challenge_pending
+                ):
+                    continue
+                probe.challenge_pending = False
+                ret.extend(self._build_path_probe_datagrams(probe, now))
+
         return ret
 
     def get_next_available_stream_id(self, is_unidirectional=False) -> int:
@@ -692,6 +719,14 @@ class QuicConnection:
             if self._pacing_at is not None and self._pacing_at < timer_at:
                 timer_at = self._pacing_at
 
+            # path probe timer
+            for probe in self._path_probes.values():
+                if (
+                    probe.state == QuicPathValidationState.PENDING
+                    and probe.timeout_at < timer_at
+                ):
+                    timer_at = probe.timeout_at
+
         return timer_at
 
     def handle_timer(self, now: float) -> None:
@@ -718,6 +753,23 @@ class QuicConnection:
             self._logger.debug("Loss detection triggered")
             self._loss.on_loss_detection_timeout(now=now)
 
+        # path probe timeouts
+        for probe in self._path_probes.values():
+            if probe.state != QuicPathValidationState.PENDING:
+                continue
+            if now >= probe.timeout_at:
+                if probe.attempts >= MAX_PATH_PROBE_ATTEMPTS:
+                    # validation failed, the current path keeps serving data
+                    self._logger.debug(
+                        "Network path %s validation failed", probe.network_path.addr
+                    )
+                    probe.state = QuicPathValidationState.FAILED
+                else:
+                    # retransmit the challenge
+                    probe.attempts += 1
+                    probe.challenge_pending = True
+                    probe.timeout_at = now + self._loss.get_probe_timeout()
+
     def next_event(self) -> Optional[events.QuicEvent]:
         """
         Retrieve the next event from the event buffer.
@@ -728,6 +780,22 @@ class QuicConnection:
             return self._events.popleft()
         except IndexError:
             return None
+
+    def path_validation_state(
+        self, addr: NetworkAddress
+    ) -> Optional[QuicPathValidationState]:
+        """
+        Return the validation state for the path to the given address.
+
+        Returns `None` if no validation was initiated for this address,
+        otherwise a :class:`QuicPathValidationState`.
+
+        :param addr: The network address of the remote peer.
+        """
+        probe = self._path_probes.get(addr)
+        if probe is None:
+            return None
+        return probe.state
 
     def _idle_timeout(self) -> float:
         # RFC 9000 section 10.1
@@ -1157,6 +1225,66 @@ class QuicConnection:
             raise ValueError("Cannot stop receiving on an unknown stream")
 
         stream.receiver.stop(error_code)
+
+    def switch_path(self, addr: NetworkAddress) -> None:
+        """
+        Switch the network path used to send data to the given address.
+
+        The path must previously have been validated using
+        :meth:`validate_path`. Until this method is called, data keeps
+        being sent on the current path.
+
+        This only changes the path used for sending; connection ID
+        lifecycle is managed separately, see :meth:`change_connection_id`.
+
+        .. aioquic_transmit::
+
+        :param addr: The network address of the remote peer to switch to.
+        """
+        probe = self._path_probes.get(addr)
+        if probe is None or probe.state != QuicPathValidationState.VALIDATED:
+            raise ValueError("Cannot switch to a path which is not validated")
+
+        self._logger.debug("Switching network path to %s", addr)
+        network_path = probe.network_path
+        self._network_paths.remove(network_path)
+        self._network_paths.insert(0, network_path)
+
+    def validate_path(self, addr: NetworkAddress, now: float) -> None:
+        """
+        Start actively validating the network path to the given address.
+
+        A PATH_CHALLENGE is sent to the new address while data keeps
+        flowing on the current path. Use :meth:`path_validation_state`
+        to track the outcome, then :meth:`switch_path` to start sending
+        data on the new path, or :meth:`cancel_path_validation` to abort.
+
+        .. aioquic_transmit::
+
+        :param addr: The network address of the remote peer to validate.
+        :param now: The current time.
+        """
+        assert self._handshake_complete, (
+            "cannot validate a path before the handshake completes"
+        )
+        if addr == self._network_paths[0].addr:
+            raise ValueError("Cannot validate the current network path")
+
+        probe = self._path_probes.get(addr)
+        if probe is not None and probe.state == QuicPathValidationState.PENDING:
+            raise ValueError("Path validation is already in progress")
+
+        network_path = self._find_network_path(addr)
+        if network_path not in self._network_paths:
+            self._network_paths.append(network_path)
+
+        self._logger.debug("Validating network path %s", addr)
+        self._path_probes[addr] = QuicPathProbe(
+            network_path=network_path,
+            challenge=os.urandom(8),
+            now=now,
+            timeout=self._loss.get_probe_timeout(),
+        )
 
     # Private
 
@@ -2061,6 +2189,27 @@ class QuicConnection:
             context.quic_logger_frames.append(
                 self._quic_logger.encode_path_response_frame(data=data)
             )
+
+        # check active path probes: the response must match a challenge we
+        # sent to the path it was received on, a response echoed back from
+        # a different address must not validate the probed path
+        for addr, probe in self._path_probes.items():
+            if data != probe.challenge:
+                continue
+            if (
+                probe.state == QuicPathValidationState.PENDING
+                and context.network_path.addr == addr
+            ):
+                self._logger.debug("Network path %s validated by probe", addr)
+                probe.state = QuicPathValidationState.VALIDATED
+                probe.network_path.is_validated = True
+            else:
+                self._logger.debug(
+                    "Ignoring PATH_RESPONSE for probe to %s received on %s",
+                    addr,
+                    context.network_path.addr,
+                )
+            return
 
         try:
             network_path = self._local_challenges.pop(data)
@@ -2995,6 +3144,102 @@ class QuicConnection:
             # limit.
             key = next(iter(self._local_challenges.keys()))
             del self._local_challenges[key]
+
+    def _build_path_probe_datagrams(
+        self, probe: QuicPathProbe, now: float
+    ) -> list[tuple[bytes, NetworkAddress]]:
+        """
+        Build datagrams for an active path validation probe.
+
+        Only probing frames (PATH_CHALLENGE / PATH_RESPONSE) are included,
+        and the datagram is padded as required by RFC 9000 section 8.2.1.
+        """
+        network_path = probe.network_path
+        builder = QuicPacketBuilder(
+            host_cid=self.host_cid,
+            is_client=self._is_client,
+            max_datagram_size=self._max_datagram_size,
+            packet_number=self._packet_number,
+            peer_cid=self._peer_cid.cid,
+            peer_token=self._peer_token,
+            quic_logger=self._quic_logger,
+            spin_bit=self._spin_bit,
+            version=self._version,
+        )
+        crypto = self._cryptos[tls.Epoch.ONE_RTT]
+        builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+        builder.pad_datagram()
+
+        # PATH CHALLENGE
+        self._write_path_challenge_frame(builder=builder, challenge=probe.challenge)
+
+        # PATH RESPONSE, in case the peer challenged us on the probed path
+        while len(network_path.remote_challenges) > 0:
+            self._write_path_response_frame(
+                builder=builder, challenge=network_path.remote_challenges[0]
+            )
+            network_path.remote_challenges.popleft()
+
+        datagrams, packets = builder.flush()
+        if not datagrams:
+            return []
+
+        self._packet_number = builder.packet_number
+
+        # register packets
+        for packet in packets:
+            packet.sent_time = now
+            self._loss.on_packet_sent(
+                packet=packet, space=self._spaces[tls.Epoch.ONE_RTT]
+            )
+            self._log_packet_sent(packet)
+
+        ret = []
+        for datagram in datagrams:
+            payload_length = len(datagram)
+            network_path.bytes_sent += payload_length
+            ret.append((datagram, network_path.addr))
+            self._log_datagram_sent(payload_length)
+        return ret
+
+    def _log_datagram_sent(self, payload_length: int) -> None:
+        if self._quic_logger is not None:
+            self._quic_logger.log_event(
+                category="transport",
+                event="datagrams_sent",
+                data={
+                    "count": 1,
+                    "raw": [
+                        {
+                            "length": UDP_HEADER_SIZE + payload_length,
+                            "payload_length": payload_length,
+                        }
+                    ],
+                },
+            )
+
+    def _log_packet_sent(self, packet: QuicSentPacket) -> None:
+        if self._quic_logger is not None:
+            self._quic_logger.log_event(
+                category="transport",
+                event="packet_sent",
+                data={
+                    "frames": packet.quic_logger_frames,
+                    "header": {
+                        "packet_number": packet.packet_number,
+                        "packet_type": self._quic_logger.packet_type(
+                            packet.packet_type
+                        ),
+                        "scid": (
+                            ""
+                            if packet.packet_type == QuicPacketType.ONE_RTT
+                            else dump_cid(self.host_cid)
+                        ),
+                        "dcid": dump_cid(self._peer_cid.cid),
+                    },
+                    "raw": {"length": packet.sent_bytes},
+                },
+            )
 
     def _write_application(
         self, builder: QuicPacketBuilder, network_path: QuicNetworkPath, now: float

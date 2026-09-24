@@ -13,6 +13,9 @@ Connection
     .. autoclass:: QuicConnection
         :members:
 
+    .. autoclass:: QuicPathValidationState
+        :members:
+
 
 Configuration
 -------------

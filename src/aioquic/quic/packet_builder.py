@@ -154,6 +154,12 @@ class QuicPacketBuilder:
         self._packets = []
         return datagrams, packets
 
+    def pad_datagram(self) -> None:
+        """
+        Pad the current datagram to the maximum datagram size.
+        """
+        self._datagram_needs_padding = True
+
     def start_frame(
         self,
         frame_type: int,
