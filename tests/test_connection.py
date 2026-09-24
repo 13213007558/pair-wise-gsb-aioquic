@@ -18,6 +18,7 @@ from aioquic.quic.connection import (
     QuicConnection,
     QuicConnectionError,
     QuicNetworkPath,
+    QuicPathValidationState,
     QuicReceiveContext,
 )
 from aioquic.quic.crypto import CryptoPair
@@ -48,6 +49,8 @@ CLIENT_ADDR = ("1.2.3.4", 1234)
 CLIENT_HANDSHAKE_DATAGRAM_SIZES = [1200]
 
 SERVER_ADDR = ("2.3.4.5", 4433)
+SERVER_ADDR_B = ("2.3.4.6", 4433)
+SERVER_ADDR_C = ("2.3.4.7", 4433)
 SERVER_INITIAL_DATAGRAM_SIZES = [1200, 1162]
 
 HANDSHAKE_COMPLETED_EVENTS = [
@@ -1944,6 +1947,186 @@ class QuicConnectionTest(TestCase):
             self.assertEqual(
                 cm.exception.reason_phrase, "Clients must not send NEW_TOKEN frames"
             )
+
+    def test_probe_network_path_and_switch(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+
+            # business traffic uses the original path
+            client.send_stream_data(0, b"01234567")
+            datagrams = client.datagrams_to_send(now=now)
+            self.assertEqual({addr for _, addr in datagrams}, {SERVER_ADDR})
+            for data, addr in datagrams:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # start validating a new path
+            client.probe_network_path(SERVER_ADDR_B, now=now)
+            self.assertEqual(
+                client.get_path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR)
+
+            # business traffic keeps using the current path, the new path
+            # only receives a PATH_CHALLENGE probe
+            client.send_stream_data(0, b"89012345")
+            datagrams = client.datagrams_to_send(now=now)
+            by_addr = {}
+            for data, addr in datagrams:
+                by_addr.setdefault(addr, []).append(data)
+            self.assertEqual(set(by_addr), {SERVER_ADDR, SERVER_ADDR_B})
+
+            # the probe only carries a PATH_CHALLENGE frame
+            log = client.configuration.quic_logger.to_dict()
+            probe_frames = None
+            for event in reversed(log["traces"][0]["events"]):
+                if event["name"] == "transport:packet_sent":
+                    probe_frames = [f["frame_type"] for f in event["data"]["frames"]]
+                    break
+            self.assertEqual(probe_frames, ["path_challenge"])
+
+            # deliver business data and probe to the server
+            for data in by_addr[SERVER_ADDR]:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+            for data in by_addr[SERVER_ADDR_B]:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # the server responds, the response is received from the
+            # probed address
+            for data, addr in server.datagrams_to_send(now=now):
+                client.receive_datagram(data, SERVER_ADDR_B, now=now)
+
+            # the path is validated but not yet used
+            self.assertEqual(
+                client.get_path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.VALIDATED,
+            )
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR)
+
+            # explicitly switch to the new path
+            client.switch_network_path(SERVER_ADDR_B)
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR_B)
+
+            # business traffic now goes to the new path
+            client.send_stream_data(0, b"abcdefgh")
+            datagrams = client.datagrams_to_send(now=now)
+            self.assertEqual({addr for _, addr in datagrams}, {SERVER_ADDR_B})
+            for data, addr in datagrams:
+                server.receive_datagram(data, CLIENT_ADDR, now=now)
+
+            # the stream was not disrupted by the switch
+            received = b""
+            while True:
+                event = server.next_event()
+                if event is None:
+                    break
+                if isinstance(event, events.StreamDataReceived):
+                    received += event.data
+            self.assertEqual(received, b"0123456789012345abcdefgh")
+
+    def test_probe_network_path_response_on_wrong_path(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+            client.probe_network_path(SERVER_ADDR_B, now=now)
+            validation = client._path_validations[SERVER_ADDR_B]
+
+            # a PATH_RESPONSE echoing the challenge but received from
+            # another address must not validate the probed path
+            context = client_receive_context(client)
+            context.network_path = client._find_network_path(SERVER_ADDR_C)
+            client._handle_path_response_frame(
+                context, QuicFrameType.PATH_RESPONSE, Buffer(data=validation.challenge)
+            )
+            self.assertEqual(
+                client.get_path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.PENDING,
+            )
+            self.assertFalse(validation.network_path.is_validated)
+
+            # the same bytes received on the probed path do validate it
+            context = client_receive_context(client)
+            context.network_path = validation.network_path
+            client._handle_path_response_frame(
+                context, QuicFrameType.PATH_RESPONSE, Buffer(data=validation.challenge)
+            )
+            self.assertEqual(
+                client.get_path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.VALIDATED,
+            )
+            self.assertTrue(validation.network_path.is_validated)
+
+    def test_probe_network_path_timeout(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+            client.probe_network_path(SERVER_ADDR_B, now=now)
+
+            # the probe is sent to the probed address only
+            datagrams = client.datagrams_to_send(now=now)
+            self.assertEqual({addr for _, addr in datagrams}, {SERVER_ADDR_B})
+
+            # the probe is not re-sent immediately
+            self.assertEqual(client.datagrams_to_send(now=now), [])
+
+            # let the validation expire
+            client.handle_timer(now=now + 1.0)
+            self.assertEqual(
+                client.get_path_validation_state(SERVER_ADDR_B),
+                QuicPathValidationState.FAILED,
+            )
+
+            # the failed path is dropped, the current path is unaffected
+            self.assertEqual(len(client._network_paths), 1)
+            self.assertEqual(client._network_paths[0].addr, SERVER_ADDR)
+
+            # business traffic still flows on the original path
+            client.send_stream_data(0, b"01234567")
+            datagrams = client.datagrams_to_send(now=now + 1.0)
+            self.assertEqual({addr for _, addr in datagrams}, {SERVER_ADDR})
+            for data, addr in datagrams:
+                server.receive_datagram(data, CLIENT_ADDR, now=now + 1.0)
+            received = b""
+            while True:
+                event = server.next_event()
+                if event is None:
+                    break
+                if isinstance(event, events.StreamDataReceived):
+                    received += event.data
+            self.assertEqual(received, b"01234567")
+
+    def test_probe_network_path_cancel(self):
+        with client_and_server() as (client, server):
+            now = time.time()
+            client.probe_network_path(SERVER_ADDR_B, now=now)
+            self.assertEqual(len(client._network_paths), 2)
+
+            client.cancel_path_validation(SERVER_ADDR_B)
+            self.assertIsNone(client.get_path_validation_state(SERVER_ADDR_B))
+            self.assertEqual(len(client._network_paths), 1)
+
+            # no probe is sent, business traffic uses the current path
+            client.send_stream_data(0, b"01234567")
+            datagrams = client.datagrams_to_send(now=now)
+            self.assertEqual({addr for _, addr in datagrams}, {SERVER_ADDR})
+
+            # there is no pending validation to cancel anymore
+            with self.assertRaises(ValueError):
+                client.cancel_path_validation(SERVER_ADDR_B)
+
+    def test_probe_network_path_current_path(self):
+        with client_and_server() as (client, server):
+            with self.assertRaises(ValueError):
+                client.probe_network_path(SERVER_ADDR, now=time.time())
+
+    def test_switch_network_path_requires_validation(self):
+        with client_and_server() as (client, server):
+            # no validation was performed
+            with self.assertRaises(ValueError):
+                client.switch_network_path(SERVER_ADDR_B)
+
+            # validation is still pending
+            client.probe_network_path(SERVER_ADDR_B, now=time.time())
+            with self.assertRaises(ValueError):
+                client.switch_network_path(SERVER_ADDR_B)
 
     def test_handle_path_challenge_frame(self):
         with client_and_server() as (client, server):
