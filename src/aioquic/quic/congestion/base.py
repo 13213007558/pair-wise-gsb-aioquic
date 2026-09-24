@@ -37,6 +37,9 @@ class QuicCongestionControl(abc.ABC):
     @abc.abstractmethod
     def on_rtt_measurement(self, *, now: float, rtt: float) -> None: ...
 
+    def set_max_datagram_size(self, max_datagram_size: int) -> None:
+        self._max_datagram_size = max_datagram_size
+
     def get_log_data(self) -> dict[str, Any]:
         data = {"cwnd": self.congestion_window, "bytes_in_flight": self.bytes_in_flight}
         if self.ssthresh is not None:

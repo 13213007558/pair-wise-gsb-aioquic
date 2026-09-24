@@ -45,10 +45,11 @@ from .utils import (
 )
 
 CLIENT_ADDR = ("1.2.3.4", 1234)
+CLIENT_ADDR_2 = ("1.2.3.4", 1235)
 CLIENT_HANDSHAKE_DATAGRAM_SIZES = [1200]
 
 SERVER_ADDR = ("2.3.4.5", 4433)
-SERVER_INITIAL_DATAGRAM_SIZES = [1200, 1162]
+SERVER_INITIAL_DATAGRAM_SIZES = [1200, 1166]
 
 HANDSHAKE_COMPLETED_EVENTS = [
     events.HandshakeCompleted,
@@ -436,8 +437,9 @@ class QuicConnectionTest(TestCase):
 
     def test_connect_with_custom_packet_size(self):
         """
-        Check that the size of the initial QUIC packet corresponds to the
-        packet size configuration.
+        Check that the size of the initial QUIC packet is the base datagram
+        size, the configured maximum datagram size is only used once path
+        MTU discovery has validated it.
         """
 
         client_configuration = QuicConfiguration(is_client=True, max_datagram_size=1480)
@@ -448,7 +450,7 @@ class QuicConnectionTest(TestCase):
         now = 0.0
         client.connect(SERVER_ADDR, now=now)
         items = client.datagrams_to_send(now=now)
-        self.assertEqual(datagram_sizes(items), [1480])
+        self.assertEqual(datagram_sizes(items), [SMALLEST_MAX_DATAGRAM_SIZE])
 
     def test_connect_without_loss(self):
         """
@@ -769,7 +771,7 @@ class QuicConnectionTest(TestCase):
             now = server.get_timer()
             server.handle_timer(now=now)
             items = server.datagrams_to_send(now=now)
-            self.assertEqual(datagram_sizes(items), [1200, 986])
+            self.assertEqual(datagram_sizes(items), [1200, 990])
             self.assertAlmostEqual(server.get_timer(), 0.65)
             self.assertSentPackets(server, [0, 3, 0])
             self.assertEvents(server, [])
@@ -2820,7 +2822,7 @@ class QuicConnectionTest(TestCase):
             # of our ACKs, which depends on the execution time.
             self.assertEqual(client._loss.bytes_in_flight, 0)
             self.assertGreaterEqual(client._loss.congestion_window, 13472)
-            self.assertLessEqual(client._loss.congestion_window, 13540)
+            self.assertLessEqual(client._loss.congestion_window, 13560)
 
             # artificially raise received data counter
             client._local_max_data_used = client._local_max_data
@@ -3254,6 +3256,240 @@ class QuicConnectionTest(TestCase):
                 }
             ],
         )
+
+
+class MtuLink:
+    """
+    An in-memory duplex link between a client and a server which drops
+    datagrams exceeding a configurable size, driven by a virtual clock.
+    """
+
+    def __init__(self, client_max_datagram_size=1452, server_max_datagram_size=1452):
+        client_configuration = QuicConfiguration(
+            is_client=True, max_datagram_size=client_max_datagram_size
+        )
+        client_configuration.load_verify_locations(cafile=SERVER_CACERTFILE)
+        self.client = QuicConnection(configuration=client_configuration)
+        self.client._ack_delay = 0
+        disable_packet_pacing(self.client)
+
+        server_configuration = QuicConfiguration(
+            is_client=False, max_datagram_size=server_max_datagram_size
+        )
+        server_configuration.load_cert_chain(SERVER_CERTFILE, SERVER_KEYFILE)
+        self.server = QuicConnection(
+            configuration=server_configuration,
+            original_destination_connection_id=self.client.original_destination_connection_id,
+        )
+        self.server._ack_delay = 0
+        disable_packet_pacing(self.server)
+
+        self.now = 0.0
+        self.client_addr = CLIENT_ADDR
+        self.client_limit = None  # maximum datagram size, client -> server
+        self.server_limit = None  # maximum datagram size, server -> client
+        self.drop_next_size = None
+
+        self.client_mtu_log = []
+        self.server_mtu_log = []
+        self.client_sent_sizes = []
+        self.server_sent_sizes = []
+
+        self.client.connect(SERVER_ADDR, now=self.now)
+
+    def run(self, duration):
+        until = self.now + duration
+        while self.now < until:
+            self.now += TICK
+            for connection in (self.client, self.server):
+                timer = connection.get_timer()
+                if timer is not None and self.now >= timer:
+                    connection.handle_timer(now=self.now)
+            self._transfer(
+                sender=self.client,
+                receiver=self.server,
+                from_addr=self.client_addr,
+                limit=self.client_limit,
+                sent_sizes=self.client_sent_sizes,
+            )
+            self._transfer(
+                sender=self.server,
+                receiver=self.client,
+                from_addr=SERVER_ADDR,
+                limit=self.server_limit,
+                sent_sizes=self.server_sent_sizes,
+            )
+            self.client_mtu_log.append(self.client._max_datagram_size)
+            self.server_mtu_log.append(self.server._max_datagram_size)
+
+    def stream_data_received(self, connection):
+        received = 0
+        while True:
+            event = connection.next_event()
+            if event is None:
+                break
+            if isinstance(event, events.StreamDataReceived):
+                received += len(event.data)
+        return received
+
+    def _transfer(self, sender, receiver, from_addr, limit, sent_sizes):
+        for data, addr in sender.datagrams_to_send(now=self.now):
+            sent_sizes.append(len(data))
+            if self.drop_next_size is not None and len(data) >= self.drop_next_size:
+                self.drop_next_size = None
+                continue
+            if limit is None or len(data) <= limit:
+                receiver.receive_datagram(data, from_addr, now=self.now)
+
+
+class QuicConnectionMtuDiscoveryTest(TestCase):
+    def test_mtu_discovery(self):
+        """
+        The connection probes the path and converges on the largest
+        datagram size the link can carry.
+        """
+        bench = MtuLink()
+        bench.client_limit = 1400
+        bench.server_limit = 1400
+        bench.run(15.0)
+
+        # both directions converged on the link's capacity
+        self.assertEqual(bench.client._max_datagram_size, 1400)
+        self.assertEqual(bench.server._max_datagram_size, 1400)
+        self.assertEqual(bench.client._mtu_prober.validated_size, 1400)
+        self.assertEqual(bench.server._mtu_prober.validated_size, 1400)
+
+        # the limit was only raised to sizes confirmed by a probe, it
+        # never exceeded what the link could carry
+        self.assertEqual(max(bench.client_mtu_log), 1400)
+        self.assertEqual(max(bench.server_mtu_log), 1400)
+
+        # probes were sent as standalone datagrams, distinguishable from
+        # regular traffic
+        self.assertTrue(
+            any(size > SMALLEST_MAX_DATAGRAM_SIZE for size in bench.client_sent_sizes)
+        )
+        self.assertTrue(
+            any(size > SMALLEST_MAX_DATAGRAM_SIZE for size in bench.server_sent_sizes)
+        )
+
+    def test_mtu_discovery_disabled_by_default(self):
+        """
+        With the default configuration, no probing takes place.
+        """
+        bench = MtuLink(
+            client_max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+            server_max_datagram_size=SMALLEST_MAX_DATAGRAM_SIZE,
+        )
+        bench.run(5.0)
+
+        self.assertEqual(bench.client._max_datagram_size, SMALLEST_MAX_DATAGRAM_SIZE)
+        self.assertEqual(bench.server._max_datagram_size, SMALLEST_MAX_DATAGRAM_SIZE)
+        self.assertEqual(max(bench.client_sent_sizes), SMALLEST_MAX_DATAGRAM_SIZE)
+        self.assertEqual(max(bench.server_sent_sizes), SMALLEST_MAX_DATAGRAM_SIZE)
+
+    def test_mtu_discovery_peer_limit(self):
+        """
+        Probing is bounded by the peer's max_udp_payload_size transport
+        parameter.
+        """
+        bench = MtuLink(client_max_datagram_size=1452, server_max_datagram_size=1280)
+        bench.run(15.0)
+
+        self.assertEqual(bench.client._max_datagram_size, 1280)
+        self.assertEqual(bench.server._max_datagram_size, 1280)
+
+    def test_mtu_discovery_probe_loss_is_not_congestion(self):
+        """
+        Failed probes are not treated as congestion and do not reduce the
+        congestion window, and the limit never drops below the base size.
+        """
+        bench = MtuLink()
+        bench.client_limit = SMALLEST_MAX_DATAGRAM_SIZE
+        bench.server_limit = SMALLEST_MAX_DATAGRAM_SIZE
+        bench.run(5.0)
+
+        # probes are being sent even though they never get through
+        self.assertTrue(
+            any(size > SMALLEST_MAX_DATAGRAM_SIZE for size in bench.client_sent_sizes)
+        )
+        congestion_window = bench.client._loss.congestion_window
+        bench.run(15.0)
+
+        self.assertGreaterEqual(bench.client._loss.congestion_window, congestion_window)
+        self.assertEqual(bench.client._loss.bytes_in_flight, 0)
+        self.assertEqual(bench.client._max_datagram_size, SMALLEST_MAX_DATAGRAM_SIZE)
+        self.assertEqual(min(bench.client_mtu_log), SMALLEST_MAX_DATAGRAM_SIZE)
+
+    def test_mtu_discovery_single_loss(self):
+        """
+        The loss of a single large packet does not invalidate the path.
+        """
+        bench = MtuLink()
+        bench.client_limit = 1400
+        bench.server_limit = 1400
+        bench.run(15.0)
+        self.assertEqual(bench.client._max_datagram_size, 1400)
+
+        # send a burst of data, losing a single full-size datagram
+        stream_id = bench.client.get_next_available_stream_id()
+        bench.client.send_stream_data(stream_id, b"x" * 100000)
+        bench.drop_next_size = 1300
+        bench.run(15.0)
+
+        self.assertEqual(bench.client._max_datagram_size, 1400)
+        self.assertEqual(bench.stream_data_received(bench.server), 100000)
+
+    def test_mtu_discovery_black_hole(self):
+        """
+        When the path can no longer sustain the validated size, the
+        connection falls back to the base size and probes again.
+        """
+        bench = MtuLink()
+        bench.client_limit = 1400
+        bench.server_limit = 1400
+        bench.run(15.0)
+        self.assertEqual(bench.client._max_datagram_size, 1400)
+
+        # the link can suddenly only carry smaller datagrams
+        bench.client_limit = 1300
+        log_mark = len(bench.client_mtu_log)
+        stream_id = bench.client.get_next_available_stream_id()
+        bench.client.send_stream_data(stream_id, b"y" * 200000)
+        bench.run(30.0)
+
+        # the connection fell back to the base size, then converged on
+        # the new link capacity
+        self.assertIn(SMALLEST_MAX_DATAGRAM_SIZE, bench.client_mtu_log[log_mark:])
+        self.assertEqual(bench.client._max_datagram_size, 1300)
+        self.assertEqual(bench.stream_data_received(bench.server), 200000)
+
+    def test_mtu_discovery_migration(self):
+        """
+        After migrating to a new address, path MTU discovery starts over
+        for the new path.
+        """
+        bench = MtuLink()
+        bench.client_limit = 1400
+        bench.server_limit = 1400
+        bench.run(15.0)
+        self.assertEqual(bench.server._max_datagram_size, 1400)
+
+        # the client migrates to a new address
+        bench.client_addr = CLIENT_ADDR_2
+        bench.client.send_ping(uid=1)
+        bench.server_mtu_log.clear()
+        bench.run(1.0)
+
+        # the server's probing state for the new path starts from the
+        # base size
+        self.assertEqual(bench.server._mtu_path.addr, CLIENT_ADDR_2)
+        self.assertIn(SMALLEST_MAX_DATAGRAM_SIZE, bench.server_mtu_log)
+
+        # the new path is probed and converges again
+        bench.run(15.0)
+        self.assertEqual(bench.server._max_datagram_size, 1400)
+        self.assertEqual(bench.client._max_datagram_size, 1400)
 
 
 class QuicNetworkPathTest(TestCase):

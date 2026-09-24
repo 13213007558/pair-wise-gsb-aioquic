@@ -4,6 +4,12 @@ Changelog
 1.3.0
 -----
 
+* Add support for Datagram Packetization Layer Path MTU Discovery (DPLPMTUD)
+  as described in :rfc:`9000` section 14.4. The `max_datagram_size`
+  configuration now acts as an upper bound, the usable datagram size starts
+  at 1200 bytes and is raised only once larger probes have been acknowledged
+  by the peer.
+
 * Ensure PATH_CHALLENGE frames are sent before other frame types.
 * Reclaim memory when HTTP/3 streams end.
 * Limit the number of remote PATH_CHALLENGE stored per path.

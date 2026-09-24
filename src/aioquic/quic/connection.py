@@ -27,6 +27,7 @@ from . import events
 from .configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
 from .congestion.base import K_GRANULARITY
 from .crypto import CryptoError, CryptoPair, KeyUnavailableError, NoCallback
+from .dplpmtud import DEFAULT_MAX_UDP_PAYLOAD_SIZE, QuicMtuProber
 from .logger import QuicLoggerTrace
 from .packet import (
     CONNECTION_ID_MAX_SIZE,
@@ -51,7 +52,12 @@ from .packet import (
     push_ack_frame,
     push_quic_transport_parameters,
 )
-from .packet_builder import QuicDeliveryState, QuicPacketBuilder, QuicPacketBuilderStop
+from .packet_builder import (
+    QuicDeliveryState,
+    QuicPacketBuilder,
+    QuicPacketBuilderStop,
+    QuicSentPacket,
+)
 from .recovery import QuicPacketRecovery, QuicPacketSpace
 from .stream import FinalSizeError, QuicStream, StreamFinishedError
 
@@ -86,6 +92,10 @@ STREAM_COUNT_MAX = 0x1000000000000000
 UDP_HEADER_SIZE = 8
 MAX_PENDING_RETIRES = 100
 MAX_PENDING_CRYPTO = 524288  # in bytes
+
+# DPLPMTUD, see RFC 9000 section 14.4
+MTU_BLACK_HOLE_THRESHOLD = 3  # consecutive full-size losses before fallback
+MTU_FULL_SIZE_MARGIN = 32  # how close to the path MTU a packet is "full-size"
 
 NetworkAddress = Any
 
@@ -332,7 +342,11 @@ class QuicConnection:
         self._local_next_stream_id_bidi = 0 if self._is_client else 1
         self._local_next_stream_id_uni = 2 if self._is_client else 3
         self._loss_at: Optional[float] = None
-        self._max_datagram_size = configuration.max_datagram_size
+        self._max_datagram_size = SMALLEST_MAX_DATAGRAM_SIZE
+        self._mtu_blackhole_count = 0
+        self._mtu_path: Optional[QuicNetworkPath] = None
+        self._mtu_probe_pending: Optional[int] = None
+        self._mtu_prober: Optional[QuicMtuProber] = None
         self._network_paths: list[QuicNetworkPath] = []
         self._pacing_at: Optional[float] = None
         self._packet_number = 0
@@ -356,6 +370,7 @@ class QuicConnection:
         self._remote_max_stream_data_uni = 0
         self._remote_max_streams_bidi = 0
         self._remote_max_streams_uni = 0
+        self._remote_max_udp_payload_size = DEFAULT_MAX_UDP_PAYLOAD_SIZE
         self._remote_version_information: Optional[QuicVersionInformation] = None
         self._retry_count = 0
         self._retry_source_connection_id = retry_source_connection_id
@@ -535,6 +550,9 @@ class QuicConnection:
         if self._state in END_STATES:
             return []
 
+        # path MTU discovery
+        self._update_mtu_discovery(network_path=network_path)
+
         # build datagrams
         builder = QuicPacketBuilder(
             host_cid=self.host_cid,
@@ -603,10 +621,35 @@ class QuicConnection:
         if datagrams:
             self._packet_number = builder.packet_number
 
+        # build a path MTU probe if one is scheduled, the probe is a
+        # standalone datagram containing only a PING frame and padding
+        if (
+            self._mtu_probe_pending is not None
+            and self._handshake_confirmed
+            and network_path.is_validated
+        ):
+            probe_datagrams, probe_packets = self._build_mtu_probe(
+                size=self._mtu_probe_pending
+            )
+            self._mtu_probe_pending = None
+            datagrams += probe_datagrams
+            packets += probe_packets
+
+        if datagrams:
             # register packets
             sent_handshake = False
             for packet in packets:
                 packet.sent_time = now
+
+                # track full-size packets for DPLPMTUD black hole detection
+                if (
+                    packet.in_flight
+                    and self._max_datagram_size > SMALLEST_MAX_DATAGRAM_SIZE
+                    and packet.sent_bytes
+                    >= self._max_datagram_size - MTU_FULL_SIZE_MARGIN
+                ):
+                    packet.delivery_handlers.append((self._on_full_size_delivery, ()))
+
                 self._loss.on_packet_sent(
                     packet=packet, space=self._spaces[packet.epoch]
                 )
@@ -2399,6 +2442,46 @@ class QuicConnection:
         else:
             self._ping_pending.extend(uids)
 
+    def _on_full_size_delivery(self, delivery: QuicDeliveryState) -> None:
+        """
+        Callback when a full-size packet is acknowledged or lost, used for
+        DPLPMTUD black hole detection.
+        """
+        if delivery == QuicDeliveryState.ACKED:
+            self._mtu_blackhole_count = 0
+        elif (
+            self._mtu_prober is not None
+            and self._max_datagram_size > SMALLEST_MAX_DATAGRAM_SIZE
+        ):
+            # a single lost packet does not mean the path cannot sustain
+            # the current datagram size, but a persistent black hole means
+            # we need to fall back to the base size and probe again
+            self._mtu_blackhole_count += 1
+            if self._mtu_blackhole_count >= MTU_BLACK_HOLE_THRESHOLD:
+                self._logger.info(
+                    "Path MTU black hole detected, falling back to %d bytes",
+                    SMALLEST_MAX_DATAGRAM_SIZE,
+                )
+                self._mtu_prober.reset()
+                self._mtu_probe_pending = None
+                self._set_max_datagram_size(SMALLEST_MAX_DATAGRAM_SIZE)
+
+    def _on_mtu_probe_delivery(self, delivery: QuicDeliveryState, size: int) -> None:
+        """
+        Callback when a path MTU probe is acknowledged or lost.
+        """
+        prober = self._mtu_prober
+        if prober is None:
+            return
+        if delivery == QuicDeliveryState.ACKED:
+            validated_size = prober.on_probe_acked(size)
+            if validated_size is not None:
+                self._logger.info("Path MTU probe of %d bytes succeeded", size)
+                self._set_max_datagram_size(validated_size)
+        else:
+            self._logger.debug("Path MTU probe of %d bytes lost", size)
+            prober.on_probe_lost(size)
+
     def _on_retire_connection_id_delivery(
         self, delivery: QuicDeliveryState, sequence_number: int
     ) -> None:
@@ -2676,6 +2759,80 @@ class QuicConnection:
     def _send_probe(self) -> None:
         self._probe_pending = True
 
+    def _build_mtu_probe(
+        self, *, size: int
+    ) -> tuple[list[bytes], list[QuicSentPacket]]:
+        """
+        Build a path MTU probe: a standalone datagram containing a PING
+        frame padded to the probed size, see RFC 9000 section 14.4.1.
+        """
+        builder = QuicPacketBuilder(
+            host_cid=self.host_cid,
+            is_client=self._is_client,
+            max_datagram_size=size,
+            packet_number=self._packet_number,
+            peer_cid=self._peer_cid.cid,
+            peer_token=self._peer_token,
+            quic_logger=self._quic_logger,
+            spin_bit=self._spin_bit,
+            version=self._version,
+        )
+        crypto = self._cryptos[tls.Epoch.ONE_RTT]
+        builder.start_packet(QuicPacketType.ONE_RTT, crypto)
+        self._write_mtu_probe_frame(builder=builder, size=size)
+        builder.pad_datagram()
+        datagrams, packets = builder.flush()
+
+        # MTU probes are ack-eliciting but their loss must not be treated
+        # as an indication of congestion, so they are not in-flight
+        for packet in packets:
+            packet.in_flight = False
+
+        self._packet_number = builder.packet_number
+        return datagrams, packets
+
+    def _set_max_datagram_size(self, size: int) -> None:
+        if size != self._max_datagram_size:
+            self._logger.debug(
+                "Max datagram size changed: %d -> %d", self._max_datagram_size, size
+            )
+            self._max_datagram_size = size
+            self._loss.set_max_datagram_size(size)
+            self._mtu_blackhole_count = 0
+
+    def _update_mtu_discovery(self, *, network_path: QuicNetworkPath) -> None:
+        """
+        Update path MTU discovery state, see RFC 9000 section 14.4.
+        """
+        # the search is bounded by our configuration and the peer's
+        # max_udp_payload_size transport parameter
+        max_size = min(
+            self._configuration.max_datagram_size,
+            self._remote_max_udp_payload_size,
+        )
+
+        # (re-)initialize the prober when the network path changes
+        if network_path is not self._mtu_path:
+            self._mtu_path = network_path
+            self._mtu_prober = QuicMtuProber(max_size=max_size)
+            self._mtu_probe_pending = None
+            self._set_max_datagram_size(SMALLEST_MAX_DATAGRAM_SIZE)
+        elif self._mtu_prober.max_size != max_size:
+            self._mtu_prober.set_max_size(max_size)
+            if (
+                self._mtu_probe_pending is not None
+                and self._mtu_probe_pending > max_size
+            ):
+                self._mtu_probe_pending = None
+
+        # schedule the next probe
+        if (
+            self._mtu_probe_pending is None
+            and self._handshake_confirmed
+            and network_path.is_validated
+        ):
+            self._mtu_probe_pending = self._mtu_prober.get_probe()
+
     def _parse_transport_parameters(
         self, data: bytes, from_session_ticket: bool = False
     ) -> None:
@@ -2855,6 +3012,10 @@ class QuicConnection:
         self._remote_max_datagram_frame_size = (
             quic_transport_parameters.max_datagram_frame_size
         )
+        if quic_transport_parameters.max_udp_payload_size is not None:
+            self._remote_max_udp_payload_size = (
+                quic_transport_parameters.max_udp_payload_size
+            )
         for param in [
             "max_data",
             "max_stream_data_bidi_local",
@@ -2881,6 +3042,7 @@ class QuicConnection:
             initial_source_connection_id=self._local_initial_source_connection_id,
             max_ack_delay=25,
             max_datagram_frame_size=self._configuration.max_datagram_frame_size,
+            max_udp_payload_size=self._configuration.max_datagram_size,
             quantum_readiness=(
                 b"Q" * SMALLEST_MAX_DATAGRAM_SIZE
                 if self._configuration.quantum_readiness_test
@@ -3449,6 +3611,21 @@ class QuicConnection:
             "Sending PING%s in packet %d",
             " (%s)" % comment if comment else "",
             builder.packet_number,
+        )
+
+        # log frame
+        if self._quic_logger is not None:
+            builder.quic_logger_frames.append(self._quic_logger.encode_ping_frame())
+
+    def _write_mtu_probe_frame(self, builder: QuicPacketBuilder, size: int) -> None:
+        builder.start_frame(
+            QuicFrameType.PING,
+            capacity=PING_FRAME_CAPACITY,
+            handler=self._on_mtu_probe_delivery,
+            handler_args=(size,),
+        )
+        self._logger.debug(
+            "Sending PING (MTU probe %d) in packet %d", size, builder.packet_number
         )
 
         # log frame

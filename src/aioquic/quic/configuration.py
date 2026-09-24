@@ -58,6 +58,11 @@ class QuicConfiguration:
     max_datagram_size: int = SMALLEST_MAX_DATAGRAM_SIZE
     """
     The maximum QUIC payload size in bytes to send, excluding UDP or IP overhead.
+
+    This is an upper bound: the usable datagram size starts at
+    :data:`SMALLEST_MAX_DATAGRAM_SIZE` and is only raised once path MTU
+    discovery (DPLPMTUD, see RFC 9000 section 14.4) has confirmed the path
+    can carry larger datagrams.
     """
 
     max_stream_data: int = 1048576

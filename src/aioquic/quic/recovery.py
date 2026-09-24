@@ -297,6 +297,14 @@ class QuicPacketRecovery:
         # ensure an ACK-elliciting packet is sent
         self._send_probe()
 
+    def set_max_datagram_size(self, max_datagram_size: int) -> None:
+        """
+        Update the datagram size used by congestion control and pacing,
+        as a result of path MTU discovery.
+        """
+        self._cc.set_max_datagram_size(max_datagram_size)
+        self._pacer._max_datagram_size = max_datagram_size
+
     def _detect_loss(self, *, now: float, space: QuicPacketSpace) -> None:
         """
         Check whether any packets should be declared lost.
