@@ -242,7 +242,7 @@ def transfer(sender, receiver):
     """
     datagrams = 0
     from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
-    for data, addr in sender.datagrams_to_send(now=time.time()):
+    for data, addr, ecn in sender.datagrams_to_send(now=time.time()):
         datagrams += 1
         receiver.receive_datagram(data, from_addr, now=time.time())
     return datagrams
@@ -1272,7 +1272,7 @@ class QuicConnectionTest(TestCase):
 
             # server sends close
             server.close(error_code=QuicErrorCode.NO_ERROR)
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
 
     def test_tls_error(self):
@@ -1949,7 +1949,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server() as (client, server):
             # client changes address and sends some data
             client.send_stream_data(0, b"01234567")
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1960,9 +1960,9 @@ class QuicConnectionTest(TestCase):
             self.assertTrue(server._network_paths[1].is_validated)
 
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1975,7 +1975,7 @@ class QuicConnectionTest(TestCase):
         with client_and_server() as (client, server):
             # client changes address and sends some data
             client.send_stream_data(0, b"01234567")
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 2345), now=time.time())
 
             # check paths
@@ -1987,9 +1987,9 @@ class QuicConnectionTest(TestCase):
 
             # server sends PATH_CHALLENGE and receives PATH_RESPONSE on the 1234
             # path instead of the expected 2345 path.
-            for data, addr in server.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in server.datagrams_to_send(now=time.time()):
                 client.receive_datagram(data, SERVER_ADDR, now=time.time())
-            for data, addr in client.datagrams_to_send(now=time.time()):
+            for data, addr, ecn in client.datagrams_to_send(now=time.time()):
                 server.receive_datagram(data, ("1.2.3.4", 1234), now=time.time())
 
             # check paths; note that the order is backwards from the prior test

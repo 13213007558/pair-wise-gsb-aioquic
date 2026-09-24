@@ -558,6 +558,17 @@ class QuicFrameType(IntEnum):
     DATAGRAM_WITH_LENGTH = 0x31
 
 
+class QuicEcnMarking(IntEnum):
+    """
+    The ECN codepoint of an IP packet, as defined in RFC 3168.
+    """
+
+    NOT_ECT = 0
+    ECT_1 = 1
+    ECT_0 = 2
+    CE = 3
+
+
 NON_ACK_ELICITING_FRAME_TYPES = frozenset(
     [
         QuicFrameType.ACK,

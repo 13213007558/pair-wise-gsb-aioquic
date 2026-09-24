@@ -34,6 +34,7 @@ from .packet import (
     PROBING_FRAME_TYPES,
     RETRY_INTEGRITY_TAG_SIZE,
     STATELESS_RESET_TOKEN_SIZE,
+    QuicEcnMarking,
     QuicErrorCode,
     QuicFrameType,
     QuicHeader,
@@ -520,10 +521,13 @@ class QuicConnection:
             self._version = self._configuration.supported_versions[0]
         self._connect(now=now)
 
-    def datagrams_to_send(self, now: float) -> list[tuple[bytes, NetworkAddress]]:
+    def datagrams_to_send(
+        self, now: float
+    ) -> list[tuple[bytes, NetworkAddress, QuicEcnMarking]]:
         """
-        Return a list of `(data, addr)` tuples of datagrams which need to be
-        sent, and the network address to which they need to be sent.
+        Return a list of `(data, addr, ecn)` tuples of datagrams which need
+        to be sent, the network address to which they need to be sent, and the
+        ECN codepoint which should be set on the IP packet.
 
         After calling this method call :meth:`get_timer` to know when the next
         timer needs to be set.
@@ -603,9 +607,16 @@ class QuicConnection:
         if datagrams:
             self._packet_number = builder.packet_number
 
+            # determine the ECN marking for the datagrams
+            if self._loss.ecn_enabled:
+                ecn = QuicEcnMarking.ECT_0
+            else:
+                ecn = QuicEcnMarking.NOT_ECT
+
             # register packets
             sent_handshake = False
             for packet in packets:
+                packet.ecn = ecn
                 packet.sent_time = now
                 self._loss.on_packet_sent(
                     packet=packet, space=self._spaces[packet.epoch]
@@ -645,7 +656,7 @@ class QuicConnection:
         for datagram in datagrams:
             payload_length = len(datagram)
             network_path.bytes_sent += payload_length
-            ret.append((datagram, network_path.addr))
+            ret.append((datagram, network_path.addr, ecn))
 
             if self._quic_logger is not None:
                 self._quic_logger.log_event(
@@ -740,7 +751,13 @@ class QuicConnection:
         # But not too small!
         return max(idle_timeout, 3 * self._loss.get_probe_timeout())
 
-    def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
+    def receive_datagram(
+        self,
+        data: bytes,
+        addr: NetworkAddress,
+        now: float,
+        ecn: QuicEcnMarking = QuicEcnMarking.NOT_ECT,
+    ) -> None:
         """
         Handle an incoming datagram.
 
@@ -749,6 +766,8 @@ class QuicConnection:
         :param data: The datagram which was received.
         :param addr: The network address from which the datagram was received.
         :param now: The current time.
+        :param ecn: The ECN codepoint of the IP packet which carried the
+                    datagram, or `QuicEcnMarking.NOT_ECT` if it is unknown.
         """
         payload_length = len(data)
 
@@ -1072,6 +1091,8 @@ class QuicConnection:
 
             # record packet as received
             if not space.discarded:
+                if ecn != QuicEcnMarking.NOT_ECT:
+                    space.ecn_counts[ecn] += 1
                 if packet_number > space.largest_received_packet:
                     space.largest_received_packet = packet_number
                     space.largest_received_time = now
@@ -1548,10 +1569,13 @@ class QuicConnection:
         Handle an ACK frame.
         """
         ack_rangeset, ack_delay_encoded = pull_ack_frame(buf)
+        ecn_counts: Optional[tuple[int, int, int]] = None
         if frame_type == QuicFrameType.ACK_ECN:
-            buf.pull_uint_var()
-            buf.pull_uint_var()
-            buf.pull_uint_var()
+            ecn_counts = (
+                buf.pull_uint_var(),
+                buf.pull_uint_var(),
+                buf.pull_uint_var(),
+            )
         ack_delay = (ack_delay_encoded << self._remote_ack_delay_exponent) / 1000000
 
         # log frame
@@ -1570,6 +1594,7 @@ class QuicConnection:
         self._loss.on_ack_received(
             ack_rangeset=ack_rangeset,
             ack_delay=ack_delay,
+            ecn_counts=ecn_counts,
             now=context.time,
             space=self._spaces[context.epoch],
         )
@@ -3216,13 +3241,23 @@ class QuicConnection:
         ack_delay = now - space.largest_received_time
         ack_delay_encoded = int(ack_delay * 1000000) >> self._local_ack_delay_exponent
 
+        # report ECN counts if any marked packets were received
+        if any(space.ecn_counts.values()):
+            frame_type = QuicFrameType.ACK_ECN
+        else:
+            frame_type = QuicFrameType.ACK
+
         buf = builder.start_frame(
-            QuicFrameType.ACK,
+            frame_type,
             capacity=ACK_FRAME_CAPACITY,
             handler=self._on_ack_delivery,
             handler_args=(space, space.largest_received_packet),
         )
         ranges = push_ack_frame(buf, space.ack_queue, ack_delay_encoded)
+        if frame_type == QuicFrameType.ACK_ECN:
+            buf.push_uint_var(space.ecn_counts[QuicEcnMarking.ECT_0])
+            buf.push_uint_var(space.ecn_counts[QuicEcnMarking.ECT_1])
+            buf.push_uint_var(space.ecn_counts[QuicEcnMarking.CE])
         space.ack_at = None
 
         # log frame

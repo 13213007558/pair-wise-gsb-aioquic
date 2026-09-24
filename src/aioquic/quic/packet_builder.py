@@ -11,6 +11,7 @@ from .packet import (
     NON_IN_FLIGHT_FRAME_TYPES,
     PACKET_FIXED_BIT,
     PACKET_NUMBER_MAX_SIZE,
+    QuicEcnMarking,
     QuicFrameType,
     QuicPacketType,
     encode_long_header_first_byte,
@@ -38,6 +39,7 @@ class QuicSentPacket:
     packet_type: QuicPacketType
     sent_time: Optional[float] = None
     sent_bytes: int = 0
+    ecn: QuicEcnMarking = QuicEcnMarking.NOT_ECT
 
     delivery_handlers: list[tuple[QuicDeliveryHandler, Any]] = field(
         default_factory=list

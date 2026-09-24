@@ -34,6 +34,11 @@ class QuicCongestionControl(abc.ABC):
         self, *, now: float, packets: Iterable[QuicSentPacket]
     ) -> None: ...
 
+    def on_congestion_event(self, *, now: float, packet_sent_time: float) -> None:
+        """
+        React to an explicit congestion signal, such as an ECN CE mark.
+        """
+
     @abc.abstractmethod
     def on_rtt_measurement(self, *, now: float, rtt: float) -> None: ...
 

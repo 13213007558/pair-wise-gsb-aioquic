@@ -1,10 +1,11 @@
 import logging
 import math
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from .congestion import cubic, reno  # noqa
 from .congestion.base import K_GRANULARITY, create_congestion_control
 from .logger import QuicLoggerTrace
+from .packet import QuicEcnMarking
 from .packet_builder import QuicDeliveryState, QuicSentPacket
 from .rangeset import RangeSet
 
@@ -20,12 +21,18 @@ class QuicPacketSpace:
         self.ack_at: Optional[float] = None
         self.ack_queue = RangeSet()
         self.discarded = False
+        self.ecn_counts = {
+            QuicEcnMarking.ECT_0: 0,
+            QuicEcnMarking.ECT_1: 0,
+            QuicEcnMarking.CE: 0,
+        }
         self.expected_packet_number = 0
         self.largest_received_packet = -1
         self.largest_received_time: Optional[float] = None
 
         # sent packets and loss
         self.ack_eliciting_in_flight = 0
+        self.ecn_acked_counts: Optional[tuple[int, int, int]] = None
         self.largest_acked_packet = 0
         self.loss_time: Optional[float] = None
         self.sent_packets: dict[int, QuicSentPacket] = {}
@@ -97,6 +104,9 @@ class QuicPacketRecovery:
         self.max_ack_delay = 0.025
         self.peer_completed_address_validation = peer_completed_address_validation
         self.spaces: list[QuicPacketSpace] = []
+
+        # whether ECN marking is used on the current network path
+        self.ecn_enabled = True
 
         # callbacks
         self._logger = logger
@@ -175,6 +185,7 @@ class QuicPacketRecovery:
         *,
         ack_rangeset: RangeSet,
         ack_delay: float,
+        ecn_counts: Optional[Sequence[int]] = None,
         now: float,
         space: QuicPacketSpace,
     ) -> None:
@@ -185,6 +196,7 @@ class QuicPacketRecovery:
         largest_acked = ack_rangeset.bounds().stop - 1
         largest_newly_acked = None
         largest_sent_time = None
+        newly_acked_ecn_marked = 0
 
         if largest_acked > space.largest_acked_packet:
             space.largest_acked_packet = largest_acked
@@ -195,6 +207,8 @@ class QuicPacketRecovery:
             if packet_number in ack_rangeset:
                 # remove packet and update counters
                 packet = space.sent_packets.pop(packet_number)
+                if packet.ecn != QuicEcnMarking.NOT_ECT:
+                    newly_acked_ecn_marked += 1
                 if packet.is_ack_eliciting:
                     is_ack_eliciting = True
                     space.ack_eliciting_in_flight -= 1
@@ -248,6 +262,16 @@ class QuicPacketRecovery:
             log_rtt = False
 
         self._detect_loss(now=now, space=space)
+
+        # process ECN counts reported by the peer
+        if ecn_counts is not None:
+            self._process_ecn_counts(
+                ecn_counts=ecn_counts,
+                newly_acked_ecn_marked=newly_acked_ecn_marked,
+                largest_sent_time=largest_sent_time,
+                now=now,
+                space=space,
+            )
 
         # reset PTO count
         self._pto_count = 0
@@ -332,6 +356,67 @@ class QuicPacketRecovery:
             ):
                 loss_space = space
         return loss_space
+
+    def _disable_ecn(self, *, reason: str, space: QuicPacketSpace) -> None:
+        """
+        Stop using ECN on the current network path, as described in
+        RFC 9000 section 13.4.2.1.
+        """
+        self.ecn_enabled = False
+        space.ecn_acked_counts = None
+        if self._logger is not None:
+            self._logger.info("ECN disabled on network path: %s", reason)
+
+    def _process_ecn_counts(
+        self,
+        *,
+        ecn_counts: Sequence[int],
+        newly_acked_ecn_marked: int,
+        largest_sent_time: float,
+        now: float,
+        space: QuicPacketSpace,
+    ) -> None:
+        """
+        Validate the ECN counts reported by the peer and inform the
+        congestion controller of any congestion experienced signal.
+        """
+        if not self.ecn_enabled:
+            return
+
+        # determine the increase since the previous report
+        previous_counts = space.ecn_acked_counts
+        if previous_counts is None:
+            previous_counts = (0, 0, 0)
+        deltas = tuple(
+            count - previous for count, previous in zip(ecn_counts, previous_counts)
+        )
+
+        # ECN counts MUST NOT decrease
+        if any(delta < 0 for delta in deltas):
+            self._disable_ecn(reason="ECN counts decreased", space=space)
+            return
+
+        # the reported counts must account for the newly acknowledged
+        # packets which were sent with an ECT marking
+        ect_delta = deltas[0] + deltas[1] + deltas[2]
+        ce_delta = deltas[2]
+        if ect_delta < newly_acked_ecn_marked or ce_delta > newly_acked_ecn_marked:
+            self._disable_ecn(
+                reason="ECN counts inconsistent with sent packets", space=space
+            )
+            return
+
+        space.ecn_acked_counts = (ecn_counts[0], ecn_counts[1], ecn_counts[2])
+
+        # react to newly reported congestion, exactly once per CE mark
+        if ce_delta:
+            self._cc.on_congestion_event(now=now, packet_sent_time=largest_sent_time)
+            self._pacer.update_rate(
+                congestion_window=self._cc.congestion_window,
+                smoothed_rtt=self._rtt_smoothed,
+            )
+            if self._quic_logger is not None:
+                self._log_metrics_updated()
 
     def _log_metrics_updated(self, log_rtt=False) -> None:
         data: dict[str, Any] = self._cc.get_log_data()

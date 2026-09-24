@@ -118,7 +118,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._transmit_task = None
 
         # send datagrams
-        for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
+        for data, addr, ecn in self._quic.datagrams_to_send(now=self._loop.time()):
             self._transport.sendto(data, addr)
 
         # re-arm timer

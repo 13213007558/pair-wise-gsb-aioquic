@@ -66,6 +66,17 @@ class RenoCongestionControl(QuicCongestionControl):
 
         # TODO : collapse congestion window if persistent congestion
 
+    def on_congestion_event(self, *, now: float, packet_sent_time: float) -> None:
+        # start a new congestion event if the packet was sent after the
+        # start of the previous congestion recovery period.
+        if packet_sent_time > self._congestion_recovery_start_time:
+            self._congestion_recovery_start_time = now
+            self.congestion_window = max(
+                int(self.congestion_window * K_LOSS_REDUCTION_FACTOR),
+                K_MINIMUM_WINDOW * self._max_datagram_size,
+            )
+            self.ssthresh = self.congestion_window
+
     def on_rtt_measurement(self, *, now: float, rtt: float) -> None:
         # check whether we should exit slow start
         if self.ssthresh is None and self._rtt_monitor.is_rtt_increasing(

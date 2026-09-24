@@ -193,6 +193,33 @@ class CubicCongestionControl(QuicCongestionControl):
             # restart a new congestion avoidance phase
             self._starting_congestion_avoidance = True
 
+    def on_congestion_event(self, *, now: float, packet_sent_time: float) -> None:
+        # start a new congestion event if the packet was sent after the
+        # start of the previous congestion recovery period.
+        if packet_sent_time > self._congestion_recovery_start_time:
+            self._congestion_recovery_start_time = now
+
+            # fast convergence
+            if self._W_max is not None and self.congestion_window < self._W_max:
+                self._W_max = int(
+                    self.congestion_window * (1 + K_CUBIC_LOSS_REDUCTION_FACTOR) / 2
+                )
+            else:
+                self._W_max = self.congestion_window
+
+            # normal congestion MD
+            new_ssthresh = max(
+                int(self.bytes_in_flight * K_CUBIC_LOSS_REDUCTION_FACTOR),
+                K_MINIMUM_WINDOW * self._max_datagram_size,
+            )
+            self.ssthresh = new_ssthresh
+            self.congestion_window = max(
+                self.ssthresh, K_MINIMUM_WINDOW * self._max_datagram_size
+            )
+
+            # restart a new congestion avoidance phase
+            self._starting_congestion_avoidance = True
+
     def on_rtt_measurement(self, *, now: float, rtt: float) -> None:
         self.rtt = rtt
         # check whether we should exit slow start
