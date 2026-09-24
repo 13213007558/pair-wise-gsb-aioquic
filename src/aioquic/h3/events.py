@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 Headers = list[tuple[bytes, bytes]]
@@ -8,6 +9,18 @@ class H3Event:
     """
     Base class for HTTP/3 events.
     """
+
+
+class DatagramTransport(Enum):
+    """
+    The transport over which an HTTP datagram is carried.
+    """
+
+    QUIC_DATAGRAM = "quic-datagram"
+    "An unreliable QUIC DATAGRAM frame."
+
+    CAPSULE = "capsule"
+    "A reliable DATAGRAM capsule (RFC 9297) on the request stream."
 
 
 @dataclass
@@ -34,7 +47,8 @@ class DataReceived(H3Event):
 class DatagramReceived(H3Event):
     """
     The DatagramReceived is fired whenever a datagram is received from the
-    the remote peer.
+    the remote peer, either in a QUIC DATAGRAM frame or in a DATAGRAM
+    capsule on the request stream.
     """
 
     data: bytes
@@ -42,6 +56,9 @@ class DatagramReceived(H3Event):
 
     stream_id: int
     "The ID of the stream the data was received for."
+
+    transport: DatagramTransport = DatagramTransport.QUIC_DATAGRAM
+    "The transport over which the datagram was received."
 
 
 @dataclass

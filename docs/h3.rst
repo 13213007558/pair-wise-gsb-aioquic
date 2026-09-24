@@ -14,12 +14,32 @@ Connection
         :members:
 
 
+Capsules
+--------
+
+.. automodule:: aioquic.h3.capsule
+
+    .. autoclass:: CapsuleDecoder
+        :members:
+
+    .. autoclass:: CapsuleProtocolError
+        :members:
+
+    .. autoclass:: CapsuleType
+        :members:
+
+    .. autofunction:: encode_capsule
+
+
 Events
 ------
 
 .. automodule:: aioquic.h3.events
 
     .. autoclass:: H3Event
+        :members:
+
+    .. autoclass:: DatagramTransport
         :members:
 
     .. autoclass:: DatagramReceived

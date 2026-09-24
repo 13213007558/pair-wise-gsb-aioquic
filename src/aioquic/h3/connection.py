@@ -7,8 +7,15 @@ from typing import FrozenSet, Optional, Set
 
 import pylsqpack
 from aioquic.buffer import UINT_VAR_MAX_SIZE, Buffer, BufferReadError, encode_uint_var
+from aioquic.h3.capsule import (
+    CapsuleDecoder,
+    CapsuleProtocolError,
+    CapsuleType,
+    encode_capsule,
+)
 from aioquic.h3.events import (
     DatagramReceived,
+    DatagramTransport,
     DataReceived,
     H3Event,
     Headers,
@@ -202,6 +209,14 @@ def stream_is_request_response(stream_id: int):
     return stream_id % 4 == 0
 
 
+def headers_include_capsule_protocol(headers: Headers) -> bool:
+    """
+    Returns True if the headers contain a Capsule-Protocol header field
+    indicating the capsule protocol (RFC 9297) is in use.
+    """
+    return any(key == b"capsule-protocol" and value == b"?1" for key, value in headers)
+
+
 def validate_header_name(key: bytes) -> None:
     """
     Validate a header name as specified by RFC 9113 section 8.2.1.
@@ -347,6 +362,8 @@ class H3Stream:
         self.blocked = False
         self.blocked_frame_size: Optional[int] = None
         self.buffer = b""
+        self.capsule_decoder: Optional[CapsuleDecoder] = None
+        self.capsule_protocol = False
         self.receiving_ended = False
         self.sending_ended = False
         self.frame_size: Optional[int] = None
@@ -459,9 +476,19 @@ class H3Connection:
 
         return []
 
-    def send_datagram(self, stream_id: int, data: bytes) -> None:
+    def send_datagram(
+        self,
+        stream_id: int,
+        data: bytes,
+        transport: DatagramTransport = DatagramTransport.QUIC_DATAGRAM,
+    ) -> None:
         """
         Send a datagram for the specified stream.
+
+        The datagram can either be sent unreliably in a QUIC DATAGRAM frame,
+        or reliably in a DATAGRAM capsule (RFC 9297) carried by the request
+        stream. The application explicitly chooses the transport, the
+        datagram is only ever sent once.
 
         If the stream ID is not a client-initiated bidirectional stream, an
         :class:`~aioquic.h3.exceptions.InvalidStreamTypeError` exception is raised.
@@ -470,6 +497,7 @@ class H3Connection:
 
         :param stream_id: The stream ID.
         :param data: The HTTP/3 datagram payload.
+        :param transport: The transport used to carry the datagram.
         """
 
         # check stream ID is valid
@@ -478,7 +506,17 @@ class H3Connection:
                 "Datagrams can only be sent for client-initiated bidirectional streams"
             )
 
-        self._quic.send_datagram_frame(encode_uint_var(stream_id // 4) + data)
+        if transport is DatagramTransport.CAPSULE:
+            # reliable transport: a DATAGRAM capsule inside a DATA frame,
+            # the payload is associated with the stream it is sent on
+            self.send_data(
+                stream_id=stream_id,
+                data=encode_capsule(CapsuleType.DATAGRAM, data),
+                end_stream=False,
+            )
+        else:
+            # unreliable transport: a QUIC DATAGRAM frame
+            self._quic.send_datagram_frame(encode_uint_var(stream_id // 4) + data)
 
     def send_push_promise(self, stream_id: int, headers: Headers) -> int:
         """
@@ -592,6 +630,8 @@ class H3Connection:
             # update state and send headers
             if stream.headers_send_state == HeadersState.INITIAL:
                 stream.headers_send_state = HeadersState.AFTER_HEADERS
+                if headers_include_capsule_protocol(headers):
+                    stream.capsule_protocol = True
             else:
                 stream.headers_send_state = HeadersState.AFTER_TRAILERS
             self._quic.send_stream_data(
@@ -737,18 +777,23 @@ class H3Connection:
             if frame_data is not None:
                 stream.content_length += len(frame_data)
 
-            if stream_ended:
-                self._check_content_length(stream)
-
-            if stream_ended or frame_data:
-                http_events.append(
-                    DataReceived(
-                        data=frame_data,
-                        push_id=stream.push_id,
-                        stream_ended=stream_ended,
-                        stream_id=stream.stream_id,
-                    )
+            if self._capsule_protocol_active(stream):
+                http_events.extend(
+                    self._receive_capsule_data(stream, frame_data or b"", stream_ended)
                 )
+            else:
+                if stream_ended:
+                    self._check_content_length(stream)
+
+                if stream_ended or frame_data:
+                    http_events.append(
+                        DataReceived(
+                            data=frame_data,
+                            push_id=stream.push_id,
+                            stream_ended=stream_ended,
+                            stream_id=stream.stream_id,
+                        )
+                    )
         elif frame_type == FrameType.HEADERS:
             # check HEADERS frame is allowed
             if stream.headers_recv_state == HeadersState.AFTER_TRAILERS:
@@ -789,6 +834,8 @@ class H3Connection:
             # update state and emit headers
             if stream.headers_recv_state == HeadersState.INITIAL:
                 stream.headers_recv_state = HeadersState.AFTER_HEADERS
+                if headers_include_capsule_protocol(headers):
+                    stream.capsule_protocol = True
             else:
                 stream.headers_recv_state = HeadersState.AFTER_TRAILERS
             http_events.append(
@@ -901,8 +948,68 @@ class H3Connection:
         except BufferReadError:
             raise DatagramError("Could not parse quarter stream ID")
         return [
-            DatagramReceived(data=data[buf.tell() :], stream_id=quarter_stream_id * 4)
+            DatagramReceived(
+                data=data[buf.tell() :],
+                stream_id=quarter_stream_id * 4,
+                transport=DatagramTransport.QUIC_DATAGRAM,
+            )
         ]
+
+    def _capsule_protocol_active(self, stream: H3Stream) -> bool:
+        """
+        Returns True if the RFC 9297 capsule protocol was negotiated for the
+        given stream: both parties sent the H3_DATAGRAM setting and the
+        request headers contained a Capsule-Protocol header field.
+        """
+        return (
+            stream.capsule_protocol
+            and self._sent_settings is not None
+            and self._sent_settings.get(Setting.H3_DATAGRAM) == 1
+            and self._received_settings is not None
+            and self._received_settings.get(Setting.H3_DATAGRAM) == 1
+        )
+
+    def _receive_capsule_data(
+        self, stream: H3Stream, data: bytes, stream_ended: bool
+    ) -> list[H3Event]:
+        """
+        Handle DATA frame payload on a stream using the capsule protocol.
+        """
+        http_events: list[H3Event] = []
+
+        if stream.capsule_decoder is None:
+            stream.capsule_decoder = CapsuleDecoder()
+        try:
+            capsules = stream.capsule_decoder.feed(data)
+            if stream_ended:
+                stream.capsule_decoder.finalize()
+        except CapsuleProtocolError as exc:
+            raise MessageError(str(exc)) from exc
+
+        for capsule_type, capsule_value in capsules:
+            if capsule_type == CapsuleType.DATAGRAM:
+                # the DATAGRAM capsule is associated with the stream it was
+                # received on, its payload is the datagram payload
+                http_events.append(
+                    DatagramReceived(
+                        data=capsule_value,
+                        stream_id=stream.stream_id,
+                        transport=DatagramTransport.CAPSULE,
+                    )
+                )
+
+        if stream_ended:
+            self._check_content_length(stream)
+            http_events.append(
+                DataReceived(
+                    data=b"",
+                    push_id=stream.push_id,
+                    stream_id=stream.stream_id,
+                    stream_ended=True,
+                )
+            )
+
+        return http_events
 
     def _receive_stream_data(self, event: StreamDataReceived) -> list[H3Event]:
         stream_id = event.stream_id
@@ -952,31 +1059,38 @@ class H3Connection:
             and stream.frame_size is not None
             and len(stream.buffer) < stream.frame_size
         ):
-            stream.content_length += len(stream.buffer)
-            http_events.append(
-                DataReceived(
-                    data=stream.buffer,
-                    push_id=stream.push_id,
-                    stream_id=stream.stream_id,
-                    stream_ended=False,
-                )
-            )
-            stream.frame_size -= len(stream.buffer)
+            chunk = stream.buffer
+            stream.content_length += len(chunk)
+            stream.frame_size -= len(chunk)
             stream.buffer = b""
+            if self._capsule_protocol_active(stream):
+                http_events.extend(self._receive_capsule_data(stream, chunk, False))
+            else:
+                http_events.append(
+                    DataReceived(
+                        data=chunk,
+                        push_id=stream.push_id,
+                        stream_id=stream.stream_id,
+                        stream_ended=False,
+                    )
+                )
             return http_events
 
         # handle lone FIN
         if stream_ended and not stream.buffer:
-            self._check_content_length(stream)
+            if self._capsule_protocol_active(stream):
+                http_events.extend(self._receive_capsule_data(stream, b"", True))
+            else:
+                self._check_content_length(stream)
 
-            http_events.append(
-                DataReceived(
-                    data=b"",
-                    push_id=stream.push_id,
-                    stream_id=stream.stream_id,
-                    stream_ended=True,
+                http_events.append(
+                    DataReceived(
+                        data=b"",
+                        push_id=stream.push_id,
+                        stream_id=stream.stream_id,
+                        stream_ended=True,
+                    )
                 )
-            )
             return http_events
 
         buf = Buffer(data=stream.buffer)
