@@ -3,7 +3,9 @@ from unittest import TestCase, skipIf
 
 from aioquic.buffer import Buffer
 from aioquic.quic.crypto import (
+    AEAD_LIMITS,
     INITIAL_CIPHER_SUITE,
+    AeadLimitReachedError,
     CryptoError,
     CryptoPair,
     derive_key_iv_hp,
@@ -355,3 +357,136 @@ class CryptoTest(TestCase):
         send(pair1, pair2, 3)
         self.assertEqual(pair1.key_phase, 1)
         self.assertEqual(pair2.key_phase, 1)
+
+    def test_key_update_previous_keys(self):
+        pair1 = self.create_crypto(is_client=True)
+        pair2 = self.create_crypto(is_client=False)
+
+        def create_packet(key_phase, packet_number):
+            buf = Buffer(capacity=100)
+            buf.push_uint8(PACKET_FIXED_BIT | key_phase << 2 | 1)
+            buf.push_bytes(binascii.unhexlify("8394c8f03e515708"))
+            buf.push_uint16(packet_number)
+            return buf.data, b"\x00\x01\x02\x03"
+
+        # pair 1 encrypts a packet with the initial key phase
+        plain_header, plain_payload = create_packet(key_phase=0, packet_number=0)
+        encrypted_0 = pair1.encrypt_packet(plain_header, plain_payload, 0)
+
+        # pair 1 updates its keys and encrypts another packet
+        pair1.update_key()
+        plain_header_1, plain_payload_1 = create_packet(key_phase=1, packet_number=1)
+        encrypted_1 = pair1.encrypt_packet(plain_header_1, plain_payload_1, 1)
+
+        # pair 2 receives the packet with the new key phase first
+        recov_header, recov_payload, recov_packet_number = pair2.decrypt_packet(
+            encrypted_1, len(plain_header_1) - 2, 2
+        )
+        self.assertEqual(recov_header, plain_header_1)
+        self.assertEqual(recov_payload, plain_payload_1)
+        self.assertEqual(recov_packet_number, 1)
+        self.assertEqual(pair2.key_phase, 1)
+
+        # the reordered packet with the previous key phase is still accepted
+        recov_header, recov_payload, recov_packet_number = pair2.decrypt_packet(
+            encrypted_0, len(plain_header) - 2, 2
+        )
+        self.assertEqual(recov_header, plain_header)
+        self.assertEqual(recov_payload, plain_payload)
+        self.assertEqual(recov_packet_number, 0)
+
+    def test_automatic_key_update(self):
+        pair = CryptoPair(confidentiality_limit=2)
+        pair.setup_initial(
+            cid=binascii.unhexlify("8394c8f03e515708"),
+            is_client=True,
+            version=PROTOCOL_VERSION,
+        )
+
+        def encrypt(packet_number):
+            pair.encrypt_packet(
+                SHORT_SERVER_PLAIN_HEADER, SHORT_SERVER_PLAIN_PAYLOAD, packet_number
+            )
+
+        # key updates are not allowed yet, the limit has no effect
+        for packet_number in range(4):
+            encrypt(packet_number)
+        self.assertEqual(pair.send.key_phase, 0)
+        self.assertFalse(pair._update_key_requested)
+
+        # once allowed, reaching the limit schedules a key update
+        pair.key_update_allowed = True
+        encrypt(4)
+        self.assertTrue(pair._update_key_requested)
+        self.assertEqual(pair.send.key_phase, 0)
+
+        # the update is performed for the next packet
+        encrypt(5)
+        self.assertEqual(pair.send.key_phase, 1)
+        self.assertTrue(pair.key_update_unconfirmed)
+
+        # the update limit cannot be bypassed while the previous update
+        # has not been confirmed
+        for packet_number in range(6, 10):
+            encrypt(packet_number)
+        self.assertEqual(pair.send.key_phase, 1)
+        self.assertFalse(pair._update_key_requested)
+
+        # an acknowledgment for a packet sent with the previous key phase
+        # does not confirm the update
+        pair.confirm_key_update(4)
+        self.assertTrue(pair.key_update_unconfirmed)
+
+        # an acknowledgment for a packet sent in the current key phase
+        # confirms the update and allows the next one
+        pair.confirm_key_update(9)
+        self.assertFalse(pair.key_update_unconfirmed)
+        encrypt(10)
+        self.assertTrue(pair._update_key_requested)
+        encrypt(11)
+        self.assertEqual(pair.send.key_phase, 0)
+
+    def test_aead_limits(self):
+        # limits from RFC 9001 section 6.6
+        self.assertEqual(AEAD_LIMITS[CipherSuite.AES_128_GCM_SHA256], (2**23, 2**52))
+        self.assertEqual(AEAD_LIMITS[CipherSuite.AES_256_GCM_SHA384], (2**52, 2**52))
+        self.assertEqual(
+            AEAD_LIMITS[CipherSuite.CHACHA20_POLY1305_SHA256], (2**62, 2**36)
+        )
+
+        # by default the limits for the negotiated cipher suite are used
+        pair = self.create_crypto(is_client=True)
+        self.assertEqual(pair.confidentiality_limit, 2**23)
+        self.assertEqual(pair.integrity_limit, 2**52)
+
+    def test_integrity_limit(self):
+        pair1 = self.create_crypto(is_client=True)
+        pair2 = CryptoPair(integrity_limit=2)
+        pair2.setup_initial(
+            cid=binascii.unhexlify("8394c8f03e515708"),
+            is_client=False,
+            version=PROTOCOL_VERSION,
+        )
+
+        def create_packet(packet_number):
+            buf = Buffer(capacity=100)
+            buf.push_uint8(PACKET_FIXED_BIT | 1)
+            buf.push_bytes(binascii.unhexlify("8394c8f03e515708"))
+            buf.push_uint16(packet_number)
+            return buf.data, b"\x00\x01\x02\x03"
+
+        def create_corrupted_packet(packet_number):
+            plain_header, plain_payload = create_packet(packet_number)
+            encrypted = pair1.encrypt_packet(plain_header, plain_payload, packet_number)
+            return encrypted[:-1] + bytes([encrypted[-1] ^ 0xFF]), len(plain_header) - 2
+
+        # packets which fail authentication are dropped, until the
+        # integrity limit is exceeded
+        for packet_number in range(2):
+            encrypted, encrypted_offset = create_corrupted_packet(packet_number)
+            with self.assertRaises(CryptoError):
+                pair2.decrypt_packet(encrypted, encrypted_offset, 0)
+
+        encrypted, encrypted_offset = create_corrupted_packet(2)
+        with self.assertRaises(AeadLimitReachedError):
+            pair2.decrypt_packet(encrypted, encrypted_offset, 0)

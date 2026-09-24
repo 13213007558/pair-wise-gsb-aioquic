@@ -21,6 +21,26 @@ class QuicConfiguration:
     A QUIC configuration.
     """
 
+    aead_confidentiality_limit: Optional[int] = None
+    """
+    The maximum number of packets which may be protected with a given
+    1-RTT key phase before an automatic key update is triggered.
+
+    By default, the confidentiality limit from :rfc:`9001` section 6.6
+    for the negotiated AEAD algorithm is used. Overriding it is only
+    meant for tests.
+    """
+
+    aead_integrity_limit: Optional[int] = None
+    """
+    The maximum number of received packets which may fail authentication
+    before the connection is closed with an ``AEAD_LIMIT_REACHED`` error.
+
+    By default, the integrity limit from :rfc:`9001` section 6.6 for the
+    negotiated AEAD algorithm is used. Overriding it is only meant for
+    tests.
+    """
+
     alpn_protocols: Optional[list[str]] = None
     """
     A list of supported ALPN protocols.

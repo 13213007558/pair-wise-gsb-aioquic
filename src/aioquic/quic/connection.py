@@ -26,7 +26,13 @@ from ..buffer import (
 from . import events
 from .configuration import SMALLEST_MAX_DATAGRAM_SIZE, QuicConfiguration
 from .congestion.base import K_GRANULARITY
-from .crypto import CryptoError, CryptoPair, KeyUnavailableError, NoCallback
+from .crypto import (
+    AeadLimitReachedError,
+    CryptoError,
+    CryptoPair,
+    KeyUnavailableError,
+    NoCallback,
+)
 from .logger import QuicLoggerTrace
 from .packet import (
     CONNECTION_ID_MAX_SIZE,
@@ -911,6 +917,16 @@ class QuicConnection:
                 plain_header, plain_payload, packet_number = crypto.decrypt_packet(
                     data[start_off:end_off], encrypted_off, space.expected_packet_number
                 )
+            except AeadLimitReachedError as exc:
+                # The number of packets which failed authentication exceeded
+                # the integrity limit for the negotiated AEAD algorithm.
+                self._logger.warning(exc)
+                self.close(
+                    error_code=QuicErrorCode.AEAD_LIMIT_REACHED,
+                    frame_type=QuicFrameType.PADDING,
+                    reason_phrase=str(exc),
+                )
+                return
             except KeyUnavailableError as exc:
                 self._logger.debug(exc)
                 if self._quic_logger is not None:
@@ -1085,8 +1101,17 @@ class QuicConnection:
 
         .. aioquic_transmit::
         """
-        assert self._handshake_complete, "cannot change key before handshake completes"
-        self._cryptos[tls.Epoch.ONE_RTT].update_key()
+        assert self._handshake_confirmed, (
+            "cannot change key before handshake is confirmed"
+        )
+        crypto = self._cryptos[tls.Epoch.ONE_RTT]
+        if crypto.key_update_unconfirmed:
+            # RFC 9001 6.1 - a new key update must not be initiated until an
+            # acknowledgment for a packet sent in the current key phase has
+            # been received.
+            self._logger.debug("Key update request ignored, not yet confirmed")
+            return
+        crypto.update_key()
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
@@ -1504,13 +1529,18 @@ class QuicConnection:
                 recv_teardown_cb=partial(self._log_key_retired, recv_secret_name),
                 send_setup_cb=partial(self._log_key_updated, send_secret_name),
                 send_teardown_cb=partial(self._log_key_retired, send_secret_name),
+                confidentiality_limit=self._configuration.aead_confidentiality_limit,
+                integrity_limit=self._configuration.aead_integrity_limit,
             )
 
         # To enable version negotiation, setup encryption keys for all
         # our supported versions.
         self._cryptos_initial = {}
         for version in self._configuration.supported_versions:
-            pair = CryptoPair()
+            pair = CryptoPair(
+                confidentiality_limit=self._configuration.aead_confidentiality_limit,
+                integrity_limit=self._configuration.aead_integrity_limit,
+            )
             pair.setup_initial(cid=peer_cid, is_client=self._is_client, version=version)
             self._cryptos_initial[version] = pair
 
@@ -1573,6 +1603,13 @@ class QuicConnection:
             now=context.time,
             space=self._spaces[context.epoch],
         )
+
+        # check whether this acknowledges a packet sent in the current key
+        # phase, lifting the restriction on initiating a new key update
+        if context.epoch == tls.Epoch.ONE_RTT:
+            self._cryptos[tls.Epoch.ONE_RTT].confirm_key_update(
+                ack_rangeset.bounds().stop - 1
+            )
 
     def _handle_connection_close_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -1673,6 +1710,7 @@ class QuicConnection:
                     self._discard_epoch(tls.Epoch.HANDSHAKE)
                     self._handshake_confirmed = True
                     self._handshake_done_pending = True
+                    self._cryptos[tls.Epoch.ONE_RTT].key_update_allowed = True
 
                 self._replenish_connection_ids()
                 self._events.append(
@@ -1772,6 +1810,7 @@ class QuicConnection:
             self._discard_epoch(tls.Epoch.HANDSHAKE)
             self._handshake_confirmed = True
             self._loss.peer_completed_address_validation = True
+            self._cryptos[tls.Epoch.ONE_RTT].key_update_allowed = True
 
     def _handle_max_data_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer

@@ -248,6 +248,18 @@ def transfer(sender, receiver):
     return datagrams
 
 
+def transfer_at(sender, receiver, now):
+    """
+    Send datagrams from `sender` to `receiver` at the given time.
+    """
+    datagrams = 0
+    from_addr = CLIENT_ADDR if sender._is_client else SERVER_ADDR
+    for data, addr in sender.datagrams_to_send(now=now):
+        datagrams += 1
+        receiver.receive_datagram(data, from_addr, now=now)
+    return datagrams
+
+
 class QuicConnectionTest(TestCase):
     def assertEvents(self, connection: QuicConnection, expected: list):
         types = []
@@ -1024,6 +1036,188 @@ class QuicConnectionTest(TestCase):
             self.check_handshake(client=client, server=server)
             self.assertEqual(client._version, QuicProtocolVersion.VERSION_1)
             self.assertEqual(server._version, QuicProtocolVersion.VERSION_1)
+
+    def test_automatic_key_update(self):
+        with client_and_server(
+            client_options={"aead_confidentiality_limit": 8},
+        ) as (client, server):
+            client_crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            server_crypto = server._cryptos[tls.Epoch.ONE_RTT]
+            consume_events(client)
+            consume_events(server)
+
+            self.assertEqual(client_crypto.key_phase, 0)
+            self.assertEqual(server_crypto.key_phase, 0)
+
+            # send packets until the confidentiality limit is reached
+            for i in range(12):
+                client.send_ping(uid=i)
+                self.assertEqual(roundtrip(client, server), (1, 1))
+
+            # both endpoints updated their keys
+            self.assertEqual(client_crypto.key_phase, 1)
+            self.assertEqual(server_crypto.key_phase, 1)
+            self.assertFalse(client_crypto.key_update_unconfirmed)
+
+            # data can still be exchanged after the key update
+            stream_id = client.get_next_available_stream_id()
+            client.send_stream_data(stream_id, b"hello")
+            self.assertEqual(roundtrip(client, server), (1, 1))
+
+            event = server.next_event()
+            self.assertEqual(type(event), events.StreamDataReceived)
+            self.assertEqual(event.data, b"hello")
+
+    def test_automatic_key_update_with_loss_and_delayed_ack(self):
+        with client_and_server(
+            client_options={"aead_confidentiality_limit": 8},
+            server_patch=lambda server: setattr(server, "_ack_delay", 0.1),
+        ) as (client, server):
+            client_crypto = client._cryptos[tls.Epoch.ONE_RTT]
+            consume_events(client)
+            consume_events(server)
+
+            # send stream data, the datagram is lost
+            stream_id = client.get_next_available_stream_id()
+            client.send_stream_data(stream_id, b"hello")
+            self.assertEqual(drop(client), 1)
+
+            # the PTO fires and the data is retransmitted, the server's
+            # acknowledgment is delayed
+            client.handle_timer(client.get_timer())
+            self.assertEqual(transfer(client, server), 1)
+            self.assertEqual(drop(server), 0)
+            self.assertEqual(transfer_at(server, client, now=server.get_timer()), 1)
+
+            # send more packets to reach the confidentiality limit
+            for i in range(10):
+                client.send_ping(uid=i)
+                transfer(client, server)
+                transfer_at(server, client, now=server.get_timer())
+
+            # the key update happened despite loss and delayed acknowledgments
+            self.assertEqual(client_crypto.key_phase, 1)
+            self.assertFalse(client_crypto.key_update_unconfirmed)
+
+            # the stream data was received intact
+            event = server.next_event()
+            self.assertEqual(type(event), events.StreamDataReceived)
+            self.assertEqual(event.data, b"hello")
+
+    def test_aead_limit_reached(self):
+        with client_and_server(
+            server_options={"aead_integrity_limit": 2},
+        ) as (client, server):
+            consume_events(client)
+            consume_events(server)
+
+            def send_corrupted_ping(sender, receiver, uid):
+                sender.send_ping(uid=uid)
+                for data, addr in sender.datagrams_to_send(now=time.time()):
+                    corrupted = data[:-1] + bytes([data[-1] ^ 0xFF])
+                    receiver.receive_datagram(corrupted, CLIENT_ADDR, now=time.time())
+
+            # packets which fail authentication are dropped
+            for i in range(2):
+                send_corrupted_ping(client, server, uid=i)
+            self.assertIsNone(server._close_event)
+
+            # exceeding the integrity limit closes the connection
+            send_corrupted_ping(client, server, uid=2)
+            self.assertIsNotNone(server._close_event)
+            self.assertEqual(
+                server._close_event.error_code, QuicErrorCode.AEAD_LIMIT_REACHED
+            )
+
+            # the peer is notified of the connection error
+            self.assertEqual(transfer(server, client), 1)
+            client.handle_timer(client.get_timer())
+            event = client.next_event()
+            self.assertEqual(type(event), events.ConnectionTerminated)
+            self.assertEqual(event.error_code, QuicErrorCode.AEAD_LIMIT_REACHED)
+
+    def test_key_update_reordered_packets(self):
+        with client_and_server() as (client, server):
+            server_crypto = server._cryptos[tls.Epoch.ONE_RTT]
+            consume_events(client)
+            consume_events(server)
+
+            # client sends stream data with the initial key phase
+            stream_id = client.get_next_available_stream_id()
+            client.send_stream_data(stream_id, b"hello")
+            old_datagrams = [
+                data for data, addr in client.datagrams_to_send(now=time.time())
+            ]
+
+            # client updates its keys and sends another packet
+            client.request_key_update()
+            client.send_ping(uid=0)
+            new_datagrams = [
+                data for data, addr in client.datagrams_to_send(now=time.time())
+            ]
+
+            # server receives the post-update datagrams first
+            for data in new_datagrams:
+                server.receive_datagram(data, CLIENT_ADDR, now=time.time())
+            self.assertEqual(server_crypto.key_phase, 1)
+
+            def dropped_packets():
+                server_log = server.configuration.quic_logger.to_dict()
+                return len(
+                    [
+                        event
+                        for event in server_log["traces"][0]["events"]
+                        if event["name"] == "transport:packet_dropped"
+                    ]
+                )
+
+            dropped = dropped_packets()
+
+            # the reordered datagram protected with the previous key phase
+            # is still accepted
+            for data in old_datagrams:
+                server.receive_datagram(data, CLIENT_ADDR, now=time.time())
+
+            event = server.next_event()
+            self.assertEqual(type(event), events.StreamDataReceived)
+            self.assertEqual(event.data, b"hello")
+
+            # the reordered datagram was not dropped
+            self.assertEqual(dropped_packets(), dropped)
+
+    def test_request_key_update(self):
+        with client_and_server() as (client, server):
+            client_crypto = client._cryptos[tls.Epoch.ONE_RTT]
+
+            # request a key update
+            client.request_key_update()
+            client.send_ping(uid=0)
+            self.assertEqual(roundtrip(client, server), (1, 1))
+            self.assertEqual(client_crypto.key_phase, 1)
+            self.assertFalse(client_crypto.key_update_unconfirmed)
+
+            # once confirmed, another update can be requested
+            client.request_key_update()
+            client.send_ping(uid=1)
+            self.assertEqual(roundtrip(client, server), (1, 1))
+            self.assertEqual(client_crypto.key_phase, 0)
+
+    def test_request_key_update_before_handshake_confirmed(self):
+        client = create_standalone_client(self)
+        with self.assertRaises(AssertionError):
+            client.request_key_update()
+
+    def test_request_key_update_not_confirmed(self):
+        with client_and_server() as (client, server):
+            client_crypto = client._cryptos[tls.Epoch.ONE_RTT]
+
+            # the second request is ignored, as the first update has not
+            # been confirmed by the peer yet
+            client.request_key_update()
+            client.request_key_update()
+            client.send_ping(uid=0)
+            self.assertEqual(roundtrip(client, server), (1, 1))
+            self.assertEqual(client_crypto.key_phase, 1)
 
     def test_connect_with_quantum_readiness(self):
         with client_and_server(client_options={"quantum_readiness_test": True}) as (

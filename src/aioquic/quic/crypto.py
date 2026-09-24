@@ -31,6 +31,24 @@ class KeyUnavailableError(CryptoError):
     pass
 
 
+class AeadLimitReachedError(CryptoError):
+    """
+    The number of received packets which failed authentication exceeded the
+    integrity limit for the negotiated AEAD algorithm (RFC 9001 section 6.6).
+    """
+
+    pass
+
+
+# AEAD usage limits from RFC 9001 section 6.6, expressed as a number of
+# packets: (confidentiality limit, integrity limit).
+AEAD_LIMITS = {
+    CipherSuite.AES_128_GCM_SHA256: (2**23, 2**52),
+    CipherSuite.AES_256_GCM_SHA384: (2**52, 2**52),
+    CipherSuite.CHACHA20_POLY1305_SHA256: (2**62, 2**36),
+}
+
+
 def derive_key_iv_hp(
     *, cipher_suite: CipherSuite, secret: bytes, version: int
 ) -> tuple[bytes, bytes, bytes]:
@@ -175,18 +193,61 @@ class CryptoPair:
         recv_teardown_cb: Callback = NoCallback,
         send_setup_cb: Callback = NoCallback,
         send_teardown_cb: Callback = NoCallback,
+        confidentiality_limit: Optional[int] = None,
+        integrity_limit: Optional[int] = None,
     ) -> None:
         self.aead_tag_size = 16
         self.recv = CryptoContext(setup_cb=recv_setup_cb, teardown_cb=recv_teardown_cb)
         self.send = CryptoContext(setup_cb=send_setup_cb, teardown_cb=send_teardown_cb)
+        self.key_update_allowed = False
+        self._confidentiality_limit = confidentiality_limit
+        self._integrity_limit = integrity_limit
+        self._previous_recv: Optional[CryptoContext] = None
+        self._sent_packet_count = 0
+        self._auth_fail_count = 0
+        self._key_update_unconfirmed = False
+        self._key_update_first_packet_number: Optional[int] = None
         self._update_key_requested = False
 
     def decrypt_packet(
         self, packet: bytes, encrypted_offset: int, expected_packet_number: int
     ) -> tuple[bytes, bytes, int]:
-        plain_header, payload, packet_number, update_key = self.recv.decrypt_packet(
-            packet, encrypted_offset, expected_packet_number
-        )
+        try:
+            (
+                plain_header,
+                payload,
+                packet_number,
+                update_key,
+            ) = self.recv.decrypt_packet(
+                packet, encrypted_offset, expected_packet_number
+            )
+        except KeyUnavailableError:
+            raise
+        except CryptoError:
+            # The packet might have been protected with the previous key phase
+            # and reordered around a key update, try the retained old keys.
+            if self._previous_recv is not None:
+                try:
+                    (
+                        plain_header,
+                        payload,
+                        packet_number,
+                        update_key,
+                    ) = self._previous_recv.decrypt_packet(
+                        packet, encrypted_offset, expected_packet_number
+                    )
+                    return plain_header, payload, packet_number
+                except CryptoError:
+                    pass
+
+            # Count authentication failures, the connection must be closed if
+            # the integrity limit for the AEAD algorithm is exceeded.
+            self._auth_fail_count += 1
+            if self._auth_fail_count > self.integrity_limit:
+                raise AeadLimitReachedError(
+                    "Number of authentication failures exceeds the AEAD integrity limit"
+                )
+            raise
         if update_key:
             self._update_key("remote_update")
         return plain_header, payload, packet_number
@@ -196,7 +257,57 @@ class CryptoPair:
     ) -> bytes:
         if self._update_key_requested:
             self._update_key("local_update")
-        return self.send.encrypt_packet(plain_header, plain_payload, packet_number)
+        if (
+            self._key_update_unconfirmed
+            and self._key_update_first_packet_number is None
+        ):
+            self._key_update_first_packet_number = packet_number
+        packet = self.send.encrypt_packet(plain_header, plain_payload, packet_number)
+
+        # Track the number of packets protected with the current send keys and
+        # schedule a key update before the confidentiality limit is reached.
+        self._sent_packet_count += 1
+        if (
+            self.key_update_allowed
+            and not self._update_key_requested
+            and not self._key_update_unconfirmed
+            and self._sent_packet_count >= self.confidentiality_limit
+        ):
+            self._update_key_requested = True
+        return packet
+
+    @property
+    def confidentiality_limit(self) -> int:
+        if self._confidentiality_limit is not None:
+            return self._confidentiality_limit
+        return AEAD_LIMITS[self.send.cipher_suite][0]
+
+    @property
+    def integrity_limit(self) -> int:
+        if self._integrity_limit is not None:
+            return self._integrity_limit
+        return AEAD_LIMITS[self.recv.cipher_suite][1]
+
+    @property
+    def key_update_unconfirmed(self) -> bool:
+        """
+        Whether a key update was performed for which no packet sent in the
+        current key phase has been acknowledged by the peer yet.
+        """
+        return self._key_update_unconfirmed
+
+    def confirm_key_update(self, packet_number: int) -> None:
+        """
+        Notify the crypto pair that the peer acknowledged a packet, which
+        lifts the restriction on initiating a new key update if the
+        acknowledged packet was sent in the current key phase.
+        """
+        if (
+            self._key_update_unconfirmed
+            and self._key_update_first_packet_number is not None
+            and packet_number >= self._key_update_first_packet_number
+        ):
+            self._key_update_unconfirmed = False
 
     def setup_initial(self, cid: bytes, is_client: bool, version: int) -> None:
         if is_client:
@@ -229,6 +340,7 @@ class CryptoPair:
     def teardown(self) -> None:
         self.recv.teardown()
         self.send.teardown()
+        self._previous_recv = None
 
     def update_key(self) -> None:
         self._update_key_requested = True
@@ -241,6 +353,19 @@ class CryptoPair:
             return self.recv.key_phase
 
     def _update_key(self, trigger: str) -> None:
+        # Retain the current receive keys to be able to decrypt legitimate
+        # packets sent with the previous key phase which arrive reordered.
+        previous_recv = CryptoContext(key_phase=self.recv.key_phase)
+        previous_recv.aead = self.recv.aead
+        previous_recv.cipher_suite = self.recv.cipher_suite
+        previous_recv.hp = self.recv.hp
+        previous_recv.secret = self.recv.secret
+        previous_recv.version = self.recv.version
+        self._previous_recv = previous_recv
+
         apply_key_phase(self.recv, next_key_phase(self.recv), trigger=trigger)
         apply_key_phase(self.send, next_key_phase(self.send), trigger=trigger)
+        self._sent_packet_count = 0
+        self._key_update_unconfirmed = True
+        self._key_update_first_packet_number = None
         self._update_key_requested = False
