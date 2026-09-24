@@ -299,6 +299,7 @@ class QuicConnection:
         self._events: Deque[events.QuicEvent] = deque()
         self._handshake_complete = False
         self._handshake_confirmed = False
+        self._prev_key_discard_at: Optional[float] = None
         self._host_cids = [
             QuicConnectionId(
                 cid=os.urandom(configuration.connection_id_length),
@@ -603,6 +604,11 @@ class QuicConnection:
         if datagrams:
             self._packet_number = builder.packet_number
 
+            # if a key update occurred, arm the timer to discard previous keys
+            crypto = self._cryptos.get(tls.Epoch.ONE_RTT)
+            if crypto is not None and crypto.recv_prev is not None:
+                self._arm_previous_key_discard(now)
+
             # register packets
             sent_handshake = False
             for packet in packets:
@@ -688,6 +694,13 @@ class QuicConnection:
             if self._loss_at is not None and self._loss_at < timer_at:
                 timer_at = self._loss_at
 
+            # previous key discard timer
+            if (
+                self._prev_key_discard_at is not None
+                and self._prev_key_discard_at < timer_at
+            ):
+                timer_at = self._prev_key_discard_at
+
             # pacing timer
             if self._pacing_at is not None and self._pacing_at < timer_at:
                 timer_at = self._pacing_at
@@ -717,6 +730,12 @@ class QuicConnection:
         if self._loss_at is not None and now >= self._loss_at:
             self._logger.debug("Loss detection triggered")
             self._loss.on_loss_detection_timeout(now=now)
+
+        # discard previous 1-RTT keys once their retention period ends
+        if self._prev_key_discard_at is not None and now >= self._prev_key_discard_at:
+            self._logger.debug("Discarding previous 1-RTT keys")
+            self._cryptos[tls.Epoch.ONE_RTT].discard_previous_keys()
+            self._prev_key_discard_at = None
 
     def next_event(self) -> Optional[events.QuicEvent]:
         """
@@ -944,6 +963,16 @@ class QuicConnection:
                             "raw": {"length": header.packet_length},
                         },
                     )
+
+                # if too many packets fail authentication, the integrity
+                # limit is reached, see RFC 9001 section 6.6
+                if crypto.recv.aead_fail >= crypto.recv.aead_fail_limit:
+                    self.close(
+                        error_code=QuicErrorCode.AEAD_LIMIT_REACHED,
+                        frame_type=QuicFrameType.PADDING,
+                        reason_phrase="AEAD integrity limit reached",
+                    )
+                    return
                 continue
 
             # check reserved bits
@@ -983,6 +1012,10 @@ class QuicConnection:
             # raise expected packet number
             if packet_number > space.expected_packet_number:
                 space.expected_packet_number = packet_number + 1
+
+            # if a key update occurred, arm the timer to discard previous keys
+            if epoch == tls.Epoch.ONE_RTT and crypto.recv_prev is not None:
+                self._arm_previous_key_discard(now)
 
             # discard initial keys and packet space
             if not self._is_client and epoch == tls.Epoch.HANDSHAKE:
@@ -1085,8 +1118,12 @@ class QuicConnection:
 
         .. aioquic_transmit::
         """
-        assert self._handshake_complete, "cannot change key before handshake completes"
-        self._cryptos[tls.Epoch.ONE_RTT].update_key()
+        assert self._handshake_confirmed, (
+            "cannot change key before handshake is confirmed"
+        )
+        crypto = self._cryptos[tls.Epoch.ONE_RTT]
+        assert crypto.update_key_allowed, "previous key update has not been confirmed"
+        crypto.update_key()
 
     def reset_stream(self, stream_id: int, error_code: int) -> None:
         """
@@ -1302,6 +1339,17 @@ class QuicConnection:
 
         self.tls.handle_message(b"", self._crypto_buffers)
         self._push_crypto_data()
+
+    def _arm_previous_key_discard(self, now: float) -> None:
+        """
+        Arm the timer to discard the previous 1-RTT keys.
+
+        Previous keys are retained for three times the PTO after a key
+        update, to allow decrypting packets reordered across the update,
+        see RFC 9001 section 6.5.
+        """
+        if self._prev_key_discard_at is None:
+            self._prev_key_discard_at = now + 3 * self._loss.get_probe_timeout()
 
     def _discard_epoch(self, epoch: tls.Epoch) -> None:
         if not self._spaces[epoch].discarded:
@@ -1573,6 +1621,13 @@ class QuicConnection:
             now=context.time,
             space=self._spaces[context.epoch],
         )
+
+        # a key update is confirmed once a packet sent with the current
+        # keys has been acknowledged, see RFC 9001 section 6
+        if context.epoch == tls.Epoch.ONE_RTT:
+            self._cryptos[tls.Epoch.ONE_RTT].confirm_key_update(
+                self._spaces[tls.Epoch.ONE_RTT].largest_acked_packet
+            )
 
     def _handle_connection_close_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -3004,6 +3059,21 @@ class QuicConnection:
             crypto = self._cryptos[tls.Epoch.ONE_RTT]
             crypto_stream = self._crypto_streams[tls.Epoch.ONE_RTT]
             packet_type = QuicPacketType.ONE_RTT
+
+            # initiate a key update if the AEAD confidentiality limit for
+            # the current keys has been reached, see RFC 9001 section 6.6
+            if crypto.send.aead_count >= crypto.send.aead_limit:
+                if self._handshake_confirmed and crypto.update_key_allowed:
+                    crypto.update_key()
+                elif not crypto.update_key_pending:
+                    # we cannot switch to new keys, so the current keys must
+                    # no longer be used
+                    self.close(
+                        error_code=QuicErrorCode.AEAD_LIMIT_REACHED,
+                        frame_type=QuicFrameType.PADDING,
+                        reason_phrase="AEAD confidentiality limit reached",
+                    )
+                    return
         elif self._cryptos[tls.Epoch.ZERO_RTT].send.is_valid():
             crypto = self._cryptos[tls.Epoch.ZERO_RTT]
             packet_type = QuicPacketType.ZERO_RTT

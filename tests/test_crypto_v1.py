@@ -355,3 +355,84 @@ class CryptoTest(TestCase):
         send(pair1, pair2, 3)
         self.assertEqual(pair1.key_phase, 1)
         self.assertEqual(pair2.key_phase, 1)
+
+    def test_key_update_previous_keys(self):
+        pair1 = self.create_crypto(is_client=True)
+        pair2 = self.create_crypto(is_client=False)
+
+        def create_packet(key_phase, packet_number):
+            buf = Buffer(capacity=100)
+            buf.push_uint8(PACKET_FIXED_BIT | key_phase << 2 | 1)
+            buf.push_bytes(binascii.unhexlify("8394c8f03e515708"))
+            buf.push_uint16(packet_number)
+            return buf.data, b"\x00\x01\x02\x03"
+
+        # pair 1 sends a packet with the initial keys, it gets delayed
+        plain_header, plain_payload = create_packet(key_phase=0, packet_number=0)
+        encrypted = pair1.encrypt_packet(plain_header, plain_payload, 0)
+
+        # pair 2 updates its keys
+        pair2.update_key()
+        new_header, new_payload = create_packet(key_phase=1, packet_number=1)
+        pair2.encrypt_packet(new_header, new_payload, 1)
+        self.assertIsNotNone(pair2.recv_prev)
+
+        # the delayed packet protected with the previous keys still decrypts
+        recov_header, recov_payload, recov_packet_number = pair2.decrypt_packet(
+            encrypted, len(plain_header) - 2, 0
+        )
+        self.assertEqual(recov_header, plain_header)
+        self.assertEqual(recov_payload, plain_payload)
+        self.assertEqual(recov_packet_number, 0)
+
+        # once the previous keys are discarded, the packet is rejected
+        pair2.discard_previous_keys()
+        with self.assertRaises(CryptoError):
+            pair2.decrypt_packet(encrypted, len(plain_header) - 2, 0)
+
+    def test_aead_limits(self):
+        # confidentiality and integrity limits, see RFC 9001 section 6.6
+        pair = CryptoPair()
+        pair.send.setup(
+            cipher_suite=CipherSuite.AES_128_GCM_SHA256,
+            secret=bytes(32),
+            version=PROTOCOL_VERSION,
+        )
+        self.assertEqual(pair.send.aead_limit, 1 << 23)
+        self.assertEqual(pair.send.aead_fail_limit, 1 << 52)
+
+        pair.send.setup(
+            cipher_suite=CipherSuite.AES_256_GCM_SHA384,
+            secret=bytes(32),
+            version=PROTOCOL_VERSION,
+        )
+        self.assertEqual(pair.send.aead_limit, 1 << 23)
+        self.assertEqual(pair.send.aead_fail_limit, 1 << 52)
+
+        pair.send.setup(
+            cipher_suite=CipherSuite.CHACHA20_POLY1305_SHA256,
+            secret=bytes(32),
+            version=PROTOCOL_VERSION,
+        )
+        self.assertEqual(pair.send.aead_limit, 1 << 62)
+        self.assertEqual(pair.send.aead_fail_limit, 1 << 36)
+
+    def test_aead_limits_preserved_across_key_update(self):
+        pair = self.create_crypto(is_client=True)
+        pair.send.aead_limit = 4
+        pair.send.aead_fail_limit = 7
+
+        # encrypt some packets, then update keys
+        for packet_number in range(3):
+            pair.encrypt_packet(
+                SHORT_SERVER_PLAIN_HEADER, SHORT_SERVER_PLAIN_PAYLOAD, packet_number
+            )
+        self.assertEqual(pair.send.aead_count, 3)
+
+        pair.update_key()
+        pair.encrypt_packet(SHORT_SERVER_PLAIN_HEADER, SHORT_SERVER_PLAIN_PAYLOAD, 3)
+
+        # the counters were reset, the configured limits were preserved
+        self.assertEqual(pair.send.aead_count, 1)
+        self.assertEqual(pair.send.aead_limit, 4)
+        self.assertEqual(pair.send.aead_fail_limit, 7)
