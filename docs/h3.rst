@@ -31,6 +31,9 @@ Events
     .. autoclass:: HeadersReceived
         :members:
 
+    .. autoclass:: PushCancelled
+        :members:
+
     .. autoclass:: PushPromiseReceived
         :members:
 

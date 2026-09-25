@@ -13,6 +13,7 @@ from aioquic.h3.events import (
     H3Event,
     Headers,
     HeadersReceived,
+    PushCancelled,
     PushPromiseReceived,
     WebTransportStreamDataReceived,
 )
@@ -139,6 +140,10 @@ class DatagramError(ProtocolError):
 
 class FrameUnexpected(ProtocolError):
     error_code = ErrorCode.H3_FRAME_UNEXPECTED
+
+
+class IdError(ProtocolError):
+    error_code = ErrorCode.H3_ID_ERROR
 
 
 class MessageError(ProtocolError):
@@ -399,6 +404,10 @@ class H3Connection:
 
         self._max_push_id: Optional[int] = 8 if self._is_client else None
         self._next_push_id: int = 0
+        self._promised_push_ids: Set[int] = set()
+        self._push_streams: dict[int, int] = {}
+        self._received_cancel_push: Set[int] = set()
+        self._sent_cancel_push: Set[int] = set()
 
         self._local_control_stream_id: Optional[int] = None
         self._local_decoder_stream_id: Optional[int] = None
@@ -525,7 +534,44 @@ class H3Connection:
         push_stream_id = self._create_uni_stream(StreamType.PUSH, push_id=push_id)
         self._quic.send_stream_data(push_stream_id, encode_uint_var(push_id))
 
+        self._push_streams[push_id] = push_stream_id
+
         return push_stream_id
+
+    def send_cancel_push(self, push_id: int) -> None:
+        """
+        Send a CANCEL_PUSH frame for the specified push ID, indicating the
+        push is no longer wanted.
+
+        If the push ID was not promised by the remote peer, or was already
+        cancelled, a :class:`ValueError` exception is raised.
+
+        .. aioquic_transmit::
+
+        :param push_id: The push ID to cancel.
+        """
+        if self._is_client:
+            if push_id not in self._promised_push_ids:
+                raise ValueError(
+                    "Push ID %d has not been promised by the peer" % push_id
+                )
+        elif push_id >= self._next_push_id:
+            raise ValueError("Push ID %d has not been promised to the peer" % push_id)
+        if push_id in self._sent_cancel_push:
+            raise ValueError("Push ID %d has already been cancelled" % push_id)
+        self._sent_cancel_push.add(push_id)
+
+        self._quic.send_stream_data(
+            self._local_control_stream_id,
+            encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(push_id)),
+        )
+
+        if self._is_client:
+            # discard any content already received for the push
+            self._discard_push_stream(push_id)
+        else:
+            # stop sending the push
+            self._abort_push_stream(push_id)
 
     def send_data(self, stream_id: int, data: bytes, end_stream: bool) -> None:
         """
@@ -679,10 +725,14 @@ class H3Connection:
             settings[Setting.ENABLE_WEBTRANSPORT] = 1
         return settings
 
-    def _handle_control_frame(self, frame_type: int, frame_data: bytes) -> None:
+    def _handle_control_frame(
+        self, frame_type: int, frame_data: bytes
+    ) -> list[H3Event]:
         """
         Handle a frame received on the peer's control stream.
         """
+        http_events: list[H3Event] = []
+
         if frame_type != FrameType.SETTINGS and not self._settings_received:
             raise MissingSettingsError
 
@@ -702,6 +752,31 @@ class H3Connection:
             if self._is_client:
                 raise FrameUnexpected("Servers must not send MAX_PUSH_ID")
             self._max_push_id = parse_max_push_id(frame_data)
+        elif frame_type == FrameType.CANCEL_PUSH:
+            buf = Buffer(data=frame_data)
+            push_id = buf.pull_uint_var()
+            assert buf.eof()
+
+            # the push ID must reference a promised push which has not
+            # already been cancelled
+            if self._is_client:
+                if push_id not in self._promised_push_ids:
+                    raise IdError(
+                        "Push ID %d has not been promised by the peer" % push_id
+                    )
+            elif push_id >= self._next_push_id:
+                raise IdError("Push ID %d has not been promised to the peer" % push_id)
+            if push_id in self._received_cancel_push:
+                raise IdError("Push ID %d has already been cancelled" % push_id)
+            self._received_cancel_push.add(push_id)
+
+            # stop the push and notify the application
+            stream_id = self._push_streams.get(push_id)
+            if self._is_client:
+                self._discard_push_stream(push_id)
+            else:
+                self._abort_push_stream(push_id)
+            http_events.append(PushCancelled(push_id=push_id, stream_id=stream_id))
         elif frame_type in (
             FrameType.DATA,
             FrameType.HEADERS,
@@ -710,12 +785,42 @@ class H3Connection:
         ):
             raise FrameUnexpected("Invalid frame type on control stream")
 
+        return http_events
+
     def _check_content_length(self, stream: H3Stream):
         if (
             stream.expected_content_length is not None
             and stream.content_length != stream.expected_content_length
         ):
             raise MessageError("content-length does not match data size")
+
+    def _push_is_cancelled(self, push_id: int) -> bool:
+        return (
+            push_id in self._sent_cancel_push or push_id in self._received_cancel_push
+        )
+
+    def _abort_push_stream(self, push_id: int) -> None:
+        """
+        Reset the push stream for the given push ID, if it is still open.
+        """
+        stream_id = self._push_streams.get(push_id)
+        if stream_id is not None:
+            stream = self._stream.get(stream_id)
+            if stream is None or not stream.sending_ended:
+                self._quic.reset_stream(stream_id, ErrorCode.H3_REQUEST_CANCELLED)
+
+    def _discard_push_stream(self, push_id: int) -> None:
+        """
+        Discard any buffered state for the given push ID, including
+        QPACK-blocked header decoding state.
+        """
+        stream_id = self._push_streams.get(push_id)
+        if stream_id is not None:
+            stream = self._stream.get(stream_id)
+            if stream is not None:
+                stream.blocked = False
+                stream.blocked_frame_size = None
+                stream.buffer = b""
 
     def _handle_request_or_push_frame(
         self,
@@ -810,6 +915,15 @@ class H3Connection:
 
             # validate headers
             validate_push_promise_headers(headers)
+
+            # validate push ID
+            if self._max_push_id is None or push_id >= self._max_push_id:
+                raise IdError(
+                    "Push ID %d is greater than the maximum allowed" % push_id
+                )
+            if push_id in self._promised_push_ids:
+                raise IdError("Push ID %d has already been promised" % push_id)
+            self._promised_push_ids.add(push_id)
 
             # log frame
             if self._quic_logger is not None:
@@ -923,6 +1037,12 @@ class H3Connection:
         Handle data received on a request or push stream.
         """
         http_events: list[H3Event] = []
+
+        # discard data for cancelled pushes
+        if stream.push_id is not None and self._push_is_cancelled(stream.push_id):
+            if stream_ended:
+                stream.receiving_ended = True
+            return http_events
 
         stream.buffer += data
         if stream_ended:
@@ -1126,7 +1246,7 @@ class H3Connection:
                     break
                 consumed = buf.tell()
 
-                self._handle_control_frame(frame_type, frame_data)
+                http_events.extend(self._handle_control_frame(frame_type, frame_data))
             elif stream.stream_type == StreamType.PUSH:
                 # fetch push id
                 if stream.push_id is None:
@@ -1135,6 +1255,16 @@ class H3Connection:
                     except BufferReadError:
                         break
                     consumed = buf.tell()
+
+                    # check the push ID is allowed
+                    if self._is_client and (
+                        self._max_push_id is None or stream.push_id >= self._max_push_id
+                    ):
+                        raise IdError(
+                            "Push ID %d is greater than the maximum allowed"
+                            % stream.push_id
+                        )
+                    self._push_streams[stream.push_id] = stream.stream_id
 
                     self._log_stream_type(
                         push_id=stream.push_id,
@@ -1197,6 +1327,13 @@ class H3Connection:
         # process unblocked streams
         for stream_id in unblocked_streams:
             stream = self._stream[stream_id]
+
+            # release decoding state for cancelled pushes
+            if stream.push_id is not None and self._push_is_cancelled(stream.push_id):
+                stream.blocked = False
+                stream.blocked_frame_size = None
+                stream.buffer = b""
+                continue
 
             # resume headers
             http_events.extend(
