@@ -3,6 +3,7 @@ import contextlib
 import copy
 from unittest import TestCase
 
+import pylsqpack
 from aioquic.buffer import Buffer, encode_uint_var
 from aioquic.h3.connection import (
     H3_ALPN,
@@ -22,8 +23,17 @@ from aioquic.h3.connection import (
     validate_response_headers,
     validate_trailers,
 )
-from aioquic.h3.events import DataReceived, HeadersReceived, PushPromiseReceived
-from aioquic.h3.exceptions import InvalidStreamTypeError, NoAvailablePushIDError
+from aioquic.h3.events import (
+    CancelPushReceived,
+    DataReceived,
+    HeadersReceived,
+    PushPromiseReceived,
+)
+from aioquic.h3.exceptions import (
+    H3Error,
+    InvalidStreamTypeError,
+    NoAvailablePushIDError,
+)
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import StreamDataReceived
 from aioquic.quic.logger import QuicLogger
@@ -297,6 +307,285 @@ class H3ConnectionTest(TestCase):
             quic_client.closed,
             (ErrorCode.H3_FRAME_UNEXPECTED, "Servers must not send MAX_PUSH_ID"),
         )
+
+    def test_handle_control_frame_cancel_push(self):
+        """
+        A client should accept a CANCEL_PUSH frame for an allowed push ID.
+        """
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # receive SETTINGS
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS)),
+                end_stream=False,
+            )
+        )
+        self.assertIsNone(quic_client.closed)
+
+        # receive CANCEL_PUSH for an allowed but not yet promised push ID
+        events = h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(events, [CancelPushReceived(push_id=0)])
+        self.assertIsNone(quic_client.closed)
+
+    def test_handle_control_frame_cancel_push_on_server(self):
+        """
+        A server should accept a CANCEL_PUSH frame for a push it promised.
+        """
+        quic_server = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=False)
+        )
+        h3_server = H3Connection(quic_server)
+
+        # receive SETTINGS and MAX_PUSH_ID
+        h3_server.handle_event(
+            StreamDataReceived(
+                stream_id=2,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS))
+                + encode_frame(FrameType.MAX_PUSH_ID, encode_uint_var(8)),
+                end_stream=False,
+            )
+        )
+        self.assertIsNone(quic_server.closed)
+
+        # send push promise
+        push_stream_id = h3_server.send_push_promise(
+            stream_id=0,
+            headers=[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/app.txt"),
+            ],
+        )
+        self.assertEqual(push_stream_id, 15)
+
+        # receive CANCEL_PUSH
+        events = h3_server.handle_event(
+            StreamDataReceived(
+                stream_id=2,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(events, [CancelPushReceived(push_id=0)])
+        self.assertIsNone(quic_server.closed)
+
+    def test_handle_control_frame_cancel_push_not_allowed(self):
+        """
+        CANCEL_PUSH for a push ID which was not allowed is H3_ID_ERROR.
+        """
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # receive SETTINGS
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS)),
+                end_stream=False,
+            )
+        )
+
+        # receive CANCEL_PUSH for a push ID greater than the maximum
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(8)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(
+            quic_client.closed,
+            (
+                ErrorCode.H3_ID_ERROR,
+                "CANCEL_PUSH frame for push ID 8 which is not allowed",
+            ),
+        )
+
+    def test_handle_control_frame_cancel_push_not_promised(self):
+        """
+        A server should not receive CANCEL_PUSH for a push it did not promise.
+        """
+        quic_server = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=False)
+        )
+        h3_server = H3Connection(quic_server)
+
+        # receive SETTINGS and MAX_PUSH_ID
+        h3_server.handle_event(
+            StreamDataReceived(
+                stream_id=2,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS))
+                + encode_frame(FrameType.MAX_PUSH_ID, encode_uint_var(8)),
+                end_stream=False,
+            )
+        )
+
+        # receive CANCEL_PUSH for an unknown push ID
+        h3_server.handle_event(
+            StreamDataReceived(
+                stream_id=2,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(
+            quic_server.closed,
+            (
+                ErrorCode.H3_ID_ERROR,
+                "CANCEL_PUSH frame for push ID 0 which was not promised",
+            ),
+        )
+
+    def test_handle_control_frame_cancel_push_twice(self):
+        """
+        A duplicated CANCEL_PUSH is H3_ID_ERROR.
+        """
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # receive SETTINGS
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS)),
+                end_stream=False,
+            )
+        )
+
+        # receive CANCEL_PUSH
+        events = h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+        # receive CANCEL_PUSH again for the same push ID
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(
+            quic_client.closed,
+            (
+                ErrorCode.H3_ID_ERROR,
+                "CANCEL_PUSH frame for push ID 0 which was already cancelled",
+            ),
+        )
+
+    def test_handle_control_frame_cancel_push_malformed(self):
+        """
+        A malformed CANCEL_PUSH frame is H3_FRAME_ERROR.
+        """
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # receive SETTINGS
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS)),
+                end_stream=False,
+            )
+        )
+
+        # receive CANCEL_PUSH with an empty payload
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, b""),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(
+            quic_client.closed,
+            (ErrorCode.H3_FRAME_ERROR, "Could not parse CANCEL_PUSH frame"),
+        )
+
+        # receive CANCEL_PUSH with trailing data
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_uint_var(StreamType.CONTROL)
+                + encode_frame(FrameType.SETTINGS, encode_settings(DUMMY_SETTINGS)),
+                end_stream=False,
+            )
+        )
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0) + b"\x00"),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(
+            quic_client.closed,
+            (ErrorCode.H3_FRAME_ERROR, "CANCEL_PUSH frame has trailing data"),
+        )
+
+    def test_send_cancel_push(self):
+        """
+        A CANCEL_PUSH frame is sent on the control stream.
+        """
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # send CANCEL_PUSH
+        quic_client.stream_queue.clear()
+        h3_client.send_cancel_push(push_id=0)
+        data = b"".join(event.data for event in quic_client.stream_queue)
+        self.assertEqual(data, encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)))
+
+        # a push ID which was not allowed cannot be cancelled
+        with self.assertRaises(NoAvailablePushIDError):
+            h3_client.send_cancel_push(push_id=8)
+
+        # a push ID which was already cancelled cannot be cancelled again
+        with self.assertRaises(H3Error):
+            h3_client.send_cancel_push(push_id=0)
+
+        # a server cannot cancel a push if the client disabled push
+        quic_server = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=False)
+        )
+        h3_server = H3Connection(quic_server)
+        with self.assertRaises(NoAvailablePushIDError):
+            h3_server.send_cancel_push(push_id=0)
 
     def test_handle_control_settings_twice(self):
         """
@@ -1088,6 +1377,277 @@ class H3ConnectionTest(TestCase):
                     ],
                 )
 
+    def test_request_with_server_push_cancelled_before_data(self):
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # send request
+            stream_id = quic_client.get_next_available_stream_id()
+            h3_client.send_headers(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/"),
+                ],
+                end_stream=True,
+            )
+            h3_transfer(quic_client, h3_server)
+
+            # send push promise, the push stream is created but no data
+            # is sent yet
+            push_stream_id = h3_server.send_push_promise(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/app.txt"),
+                ],
+            )
+            self.assertEqual(push_stream_id, 15)
+
+            # receive push promise
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(
+                events,
+                [
+                    PushPromiseReceived(
+                        headers=[
+                            (b":method", b"GET"),
+                            (b":scheme", b"https"),
+                            (b":authority", b"localhost"),
+                            (b":path", b"/app.txt"),
+                        ],
+                        push_id=0,
+                        stream_id=stream_id,
+                    )
+                ],
+            )
+
+            # the client cancels the push, the server is notified
+            h3_client.send_cancel_push(push_id=0)
+            events = h3_transfer(quic_client, h3_server)
+            self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+            # the server sends the push content anyway, the client discards it
+            h3_server.send_headers(
+                stream_id=push_stream_id,
+                headers=[
+                    (b":status", b"200"),
+                    (b"content-type", b"text/plain"),
+                ],
+            )
+            h3_server.send_data(stream_id=push_stream_id, data=b"text", end_stream=True)
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(events, [])
+
+    def test_request_with_server_push_cancelled_after_partial_data(self):
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # send request
+            stream_id = quic_client.get_next_available_stream_id()
+            h3_client.send_headers(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/"),
+                ],
+                end_stream=True,
+            )
+            h3_transfer(quic_client, h3_server)
+
+            # send push promise and start fulfilling the push
+            push_stream_id = h3_server.send_push_promise(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/app.txt"),
+                ],
+            )
+            h3_server.send_headers(
+                stream_id=push_stream_id,
+                headers=[
+                    (b":status", b"200"),
+                    (b"content-type", b"text/plain"),
+                ],
+            )
+            h3_server.send_data(stream_id=push_stream_id, data=b"te", end_stream=False)
+
+            # receive push promise and the start of the push body
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(
+                events,
+                [
+                    PushPromiseReceived(
+                        headers=[
+                            (b":method", b"GET"),
+                            (b":scheme", b"https"),
+                            (b":authority", b"localhost"),
+                            (b":path", b"/app.txt"),
+                        ],
+                        push_id=0,
+                        stream_id=stream_id,
+                    ),
+                    HeadersReceived(
+                        headers=[
+                            (b":status", b"200"),
+                            (b"content-type", b"text/plain"),
+                        ],
+                        stream_id=push_stream_id,
+                        stream_ended=False,
+                        push_id=0,
+                    ),
+                    DataReceived(
+                        data=b"te",
+                        stream_id=push_stream_id,
+                        stream_ended=False,
+                        push_id=0,
+                    ),
+                ],
+            )
+
+            # the client cancels the push, previously delivered content
+            # remains delivered
+            h3_client.send_cancel_push(push_id=0)
+            events = h3_transfer(quic_client, h3_server)
+            self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+            # the rest of the push body is discarded
+            h3_server.send_data(stream_id=push_stream_id, data=b"xt", end_stream=True)
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(events, [])
+
+    def test_request_with_server_push_cancelled_after_completion(self):
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # send request
+            stream_id = quic_client.get_next_available_stream_id()
+            h3_client.send_headers(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/"),
+                ],
+                end_stream=True,
+            )
+            h3_transfer(quic_client, h3_server)
+
+            # send push promise and fully fulfill the push
+            push_stream_id = h3_server.send_push_promise(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/app.txt"),
+                ],
+            )
+            h3_server.send_headers(
+                stream_id=push_stream_id,
+                headers=[
+                    (b":status", b"200"),
+                    (b"content-type", b"text/plain"),
+                ],
+            )
+            h3_server.send_data(stream_id=push_stream_id, data=b"text", end_stream=True)
+
+            # receive the complete push
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(
+                events,
+                [
+                    PushPromiseReceived(
+                        headers=[
+                            (b":method", b"GET"),
+                            (b":scheme", b"https"),
+                            (b":authority", b"localhost"),
+                            (b":path", b"/app.txt"),
+                        ],
+                        push_id=0,
+                        stream_id=stream_id,
+                    ),
+                    HeadersReceived(
+                        headers=[
+                            (b":status", b"200"),
+                            (b"content-type", b"text/plain"),
+                        ],
+                        stream_id=push_stream_id,
+                        stream_ended=False,
+                        push_id=0,
+                    ),
+                    DataReceived(
+                        data=b"text",
+                        stream_id=push_stream_id,
+                        stream_ended=True,
+                        push_id=0,
+                    ),
+                ],
+            )
+
+            # the client cancels the completed push, the server is notified
+            h3_client.send_cancel_push(push_id=0)
+            events = h3_transfer(quic_client, h3_server)
+            self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+    def test_request_with_server_push_cancelled_before_promise(self):
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # send request
+            stream_id = quic_client.get_next_available_stream_id()
+            h3_client.send_headers(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/"),
+                ],
+                end_stream=True,
+            )
+            h3_transfer(quic_client, h3_server)
+
+            # the server cancels the push before the promise is received
+            h3_server.send_cancel_push(push_id=0)
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+            # the promise and the push content arrive afterwards and are
+            # not presented as new content
+            push_stream_id = h3_server.send_push_promise(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/app.txt"),
+                ],
+            )
+            h3_server.send_headers(
+                stream_id=push_stream_id,
+                headers=[
+                    (b":status", b"200"),
+                    (b"content-type", b"text/plain"),
+                ],
+            )
+            h3_server.send_data(stream_id=push_stream_id, data=b"text", end_stream=True)
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(events, [])
+
     def test_send_data_after_trailers(self):
         """
         We should not send DATA after trailers.
@@ -1319,6 +1879,127 @@ class H3ConnectionTest(TestCase):
                     stream_id=0,
                     stream_ended=True,
                     push_id=None,
+                )
+            ],
+        )
+
+    def test_cancel_push_with_qpack_blocked_stream(self):
+        quic_client = FakeQuicConnection(
+            configuration=QuicConfiguration(is_client=True)
+        )
+        h3_client = H3Connection(quic_client)
+
+        # receive SETTINGS
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=binascii.unhexlify(
+                    "0004170150000680020000074064091040bcc0000000faceb00c"
+                ),
+                end_stream=False,
+            )
+        )
+        # receive QPACK encoder / decoder stream types
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=7, data=b"\x02", end_stream=False)
+        )
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=11, data=b"\x03", end_stream=False)
+        )
+
+        # receive a push stream whose HEADERS are QPACK-blocked
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=15,
+                    data=b"\x01\x00" + binascii.unhexlify("01040280d910"),
+                    end_stream=False,
+                )
+            ),
+            [],
+        )
+
+        # receive a request stream whose HEADERS are QPACK-blocked
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=0,
+                    data=binascii.unhexlify("01040280d910"),
+                    end_stream=False,
+                )
+            ),
+            [],
+        )
+
+        # the push is cancelled while its headers are blocked
+        events = h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3,
+                data=encode_frame(FrameType.CANCEL_PUSH, encode_uint_var(0)),
+                end_stream=False,
+            )
+        )
+        self.assertEqual(events, [CancelPushReceived(push_id=0)])
+
+        # receive QPACK encoder data: the cancelled push decoder state is
+        # released without emitting events, the request stream resumes
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=7,
+                    data=binascii.unhexlify(
+                        "3fe101c696d07abe941094cb6d0a08017d403971966e32ca98b46f"
+                    ),
+                    end_stream=False,
+                )
+            ),
+            [
+                HeadersReceived(
+                    headers=[
+                        (b":status", b"200"),
+                        (b"date", b"Mon, 22 Jul 2019 06:33:33 GMT"),
+                    ],
+                    stream_id=0,
+                    stream_ended=False,
+                )
+            ],
+        )
+
+        # further data on the cancelled push stream is discarded
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=15,
+                    data=encode_frame(FrameType.DATA, b"hello"),
+                    end_stream=True,
+                )
+            ),
+            [],
+        )
+
+        # other pushes and request streams are unaffected
+        encoder = pylsqpack.Encoder()
+        _, header_block = encoder.encode(
+            19,
+            [(b":status", b"200"), (b"content-type", b"text/plain")],
+        )
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=19,
+                    data=b"\x01\x01" + encode_frame(FrameType.HEADERS, header_block),
+                    end_stream=False,
+                )
+            ),
+            [
+                HeadersReceived(
+                    headers=[
+                        (b":status", b"200"),
+                        (b"content-type", b"text/plain"),
+                    ],
+                    stream_id=19,
+                    stream_ended=False,
+                    push_id=1,
                 )
             ],
         )

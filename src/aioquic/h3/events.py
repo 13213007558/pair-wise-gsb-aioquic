@@ -11,6 +11,20 @@ class H3Event:
 
 
 @dataclass
+class CancelPushReceived(H3Event):
+    """
+    The CancelPushReceived event is fired whenever a CANCEL_PUSH frame is
+    received from the remote peer.
+
+    Any content which was already delivered for the push remains valid, the
+    cancellation only affects content which has not been delivered yet.
+    """
+
+    push_id: int
+    "The Push ID of the push which was cancelled."
+
+
+@dataclass
 class DataReceived(H3Event):
     """
     The DataReceived event is fired whenever data is received on a stream from

@@ -22,6 +22,9 @@ Events
     .. autoclass:: H3Event
         :members:
 
+    .. autoclass:: CancelPushReceived
+        :members:
+
     .. autoclass:: DatagramReceived
         :members:
 
