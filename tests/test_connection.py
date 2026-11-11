@@ -91,6 +91,53 @@ HANDSHAKE_COMPLETED_EVENTS = [
 TICK = 0.05  # seconds
 
 
+class AmplificationTracker:
+    """
+    Track the datagrams a connection exchanges with each peer address, checking
+    the anti-amplification limit (RFC 9000 section 8.1) whenever it sends: to
+    an address which is not validated, the connection must not send more than
+    three times the bytes it received from that address. The transcript of all
+    datagrams is included in the failure message, to locate the send which
+    first exceeds the limit.
+    """
+
+    def __init__(self, test: TestCase, connection: QuicConnection) -> None:
+        self._connection = connection
+        self._test = test
+        self.received: dict[NetworkAddress, int] = {}
+        self.sent: dict[NetworkAddress, int] = {}
+        self.transcript: list[str] = []
+
+    def datagrams_to_send(self, now: float) -> list[tuple[bytes, NetworkAddress]]:
+        items = self._connection.datagrams_to_send(now=now)
+        for data, addr in items:
+            self.sent[addr] = self.sent.get(addr, 0) + len(data)
+            self.transcript.append(
+                f"#{len(self.transcript)} t={now:.2f} sent {len(data)} to {addr}"
+            )
+            if not self._is_validated(addr):
+                self._test.assertLessEqual(
+                    self.sent[addr],
+                    3 * self.received.get(addr, 0),
+                    f"anti-amplification limit exceeded towards {addr}:\n"
+                    + "\n".join(self.transcript),
+                )
+        return items
+
+    def receive_datagram(self, data: bytes, addr: NetworkAddress, now: float) -> None:
+        self.received[addr] = self.received.get(addr, 0) + len(data)
+        self.transcript.append(
+            f"#{len(self.transcript)} t={now:.2f} received {len(data)} from {addr}"
+        )
+        self._connection.receive_datagram(data, addr, now=now)
+
+    def _is_validated(self, addr: NetworkAddress) -> bool:
+        for path in self._connection._network_paths:
+            if path.addr == addr:
+                return path.is_validated
+        return False
+
+
 class SessionTicketStore:
     def __init__(self) -> None:
         self.tickets: dict[bytes, tls.SessionTicket] = {}
@@ -2310,6 +2357,119 @@ class QuicConnectionTimelineTest(QuicConnectionTestCase):
             self.assertAlmostEqual(server.get_timer(), 1.1125)
             self.assertEqual(self.acked_ranges(server)[-1], [[4, 6]])
 
+    def test_migrate_amplification_limit_counts_all_datagrams(self) -> None:
+        """
+        Check every datagram received from an address the server has not
+        validated raises its anti-amplification limit, even one whose packets
+        are duplicates or cannot be decrypted, and that the limit is tracked
+        per address, not per connection (RFC 9000 section 8.1).
+
+        The client migrates to a new address, from which the same datagram
+        arrives again, then an undecryptable one. Each one lets the server
+        send three times its size to the new address, and no more, however
+        much it exchanged on the validated one. Once the client answers the
+        server's PATH_CHALLENGE, the address is validated and the limit
+        lifted, so switching between the two addresses is unconstrained.
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+            tracker = AmplificationTracker(self, server)
+
+            # Client changes address and sends some data.
+            client.send_stream_data(0, b"01234567")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [39])
+            client_datagram = items[0][0]
+
+            # Server receives the data from the new address, sends an ACK and
+            # a PATH_CHALLENGE padded up to the anti-amplification limit.
+            now = self.advance_by_tick(now)
+            tracker.receive_datagram(client_datagram, NEW_CLIENT_ADDR, now=now)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [3 * 39])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 1])
+            self.assertEvents(server, [events.StreamDataReceived])
+            path_challenge_datagram = items[0][0]
+
+            # Server has data to send, but the anti-amplification limit of the
+            # new address is exhausted, and the budget of the validated
+            # address cannot be used towards it, so nothing is sent.
+            server.send_stream_data(1, bytes(10000))
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [])
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 1])
+            self.assertEvents(server, [])
+
+            # Server receives a duplicate of the client's datagram, whose
+            # packets it discards, but which raises the limit by three times
+            # its size, so it sends some of its data.
+            now = self.advance_by_tick(now)
+            with self.assertPacketsDropped(server, ["duplicate"]):
+                tracker.receive_datagram(client_datagram, NEW_CLIENT_ADDR, now=now)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [3 * 39])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 2])
+            self.assertEvents(server, [])
+
+            # Server receives a datagram it cannot decrypt, which raises the
+            # limit all the same, and is answered with exactly the budget it
+            # brings: the server has now sent three times what it received.
+            now = self.advance_by_tick(now)
+            corrupted = bytearray(client_datagram)
+            corrupted[-1] ^= 0xFF
+            with self.assertPacketsDropped(server, ["payload_decrypt_error"]):
+                tracker.receive_datagram(bytes(corrupted), NEW_CLIENT_ADDR, now=now)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [3 * 39])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 3])
+            self.assertEvents(server, [])
+            self.assertEqual(
+                tracker.sent[NEW_CLIENT_ADDR], 3 * tracker.received[NEW_CLIENT_ADDR]
+            )
+
+            # Client receives the PATH_CHALLENGE, sends a PATH_RESPONSE.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(path_challenge_datagram, SERVER_ADDR, now=now)
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200])
+            self.assertAlmostEqual(client.get_timer(), 0.9)
+            self.assertSentPackets(client, [0, 0, 1])
+            self.assertEvents(client, [])
+
+            # Server receives the PATH_RESPONSE, the address is validated and
+            # the limit lifted, so the remaining data is sent.
+            now = self.advance_by_tick(now)
+            tracker.receive_datagram(items[0][0], NEW_CLIENT_ADDR, now=now)
+            self.assertTrue(server._network_paths[0].is_validated)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200] * 8 + [532])
+            self.assertAlmostEqual(server.get_timer(), 0.921875)
+            self.assertSentPackets(server, [0, 0, 11])
+            self.assertEvents(server, [])
+
+            # Client switches back to its original address, which the
+            # handshake validated, so the server answers it without a limit.
+            client.send_stream_data(0, b"xy")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [34])
+            now = self.advance_by_tick(now)
+            tracker.receive_datagram(items[0][0], CLIENT_ADDR, now=now)
+            self.assertEqual(server.get_peer_address(), CLIENT_ADDR)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [32])
+            self.assertEqual(items[0][1], CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 0.921875)
+            self.assertSentPackets(server, [0, 0, 12])
+            self.assertEvents(server, [events.StreamDataReceived])
+
     def test_migrate_amplification_limit_probe_size(self) -> None:
         """
         Check the server only arms its PTO on a path the client migrated to if
@@ -2358,6 +2518,88 @@ class QuicConnectionTimelineTest(QuicConnectionTestCase):
             self.assertEqual(datagram_sizes(items), [36])
             self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
             self.assertEqual(len(self.path_challenges(server)), 2)
+
+    def test_migrate_amplification_limit_retransmission(self) -> None:
+        """
+        Check the server's retransmissions towards an address it has not
+        validated stay within the anti-amplification limit, until a
+        PATH_RESPONSE validates it (RFC 9000 section 8.1).
+
+        The client migrates to a new address and answers the server's
+        PATH_CHALLENGE, but its PATH_RESPONSE is lost. The server's PTO fires
+        and it sends a new PATH_CHALLENGE, still within three times the bytes
+        received from the new address. The client's second PATH_RESPONSE
+        validates the address and lifts the limit.
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+            tracker = AmplificationTracker(self, server)
+
+            # Client changes address and sends a full datagram of data.
+            client.send_stream_data(0, bytes(1168))
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1199])
+
+            # Server receives the data from the new address, sends an ACK and
+            # a PATH_CHALLENGE, padded to a full datagram.
+            now = self.advance_by_tick(now)
+            tracker.receive_datagram(items[0][0], NEW_CLIENT_ADDR, now=now)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 0.6375)
+            self.assertSentPackets(server, [0, 0, 1])
+            self.assertEvents(server, [events.StreamDataReceived])
+
+            # Client answers the PATH_CHALLENGE, its PATH_RESPONSE is lost.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200])
+            self.assertAlmostEqual(client.get_timer(), 0.6875)
+            self.assertSentPackets(client, [0, 0, 1])
+            self.assertEvents(client, [])
+
+            # Server's PTO fires, it sends a new PATH_CHALLENGE with new data
+            # (RFC 9000 section 8.2.1), within the anti-amplification limit of
+            # the still unvalidated address.
+            now = self.advance_to_timer(now, server)
+            server.handle_timer(now=now)
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 1])
+            self.assertEvents(server, [])
+            challenges = self.path_challenges(server)
+            self.assertEqual(len(challenges), 2)
+            self.assertNotEqual(challenges[0], challenges[1])
+
+            # Client answers the new PATH_CHALLENGE.
+            now = self.advance_by_tick(now)
+            client.receive_datagram(items[0][0], SERVER_ADDR, now=now)
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200])
+            self.assertAlmostEqual(client.get_timer(), 0.925)
+            self.assertSentPackets(client, [0, 0, 2])
+            self.assertEvents(client, [])
+
+            # Server receives the PATH_RESPONSE, the address is validated and
+            # the limit lifted: it sends its data, more than three times what
+            # it received from the address.
+            now = self.advance_by_tick(now)
+            tracker.receive_datagram(items[0][0], NEW_CLIENT_ADDR, now=now)
+            self.assertTrue(server._network_paths[0].is_validated)
+            server.send_stream_data(1, bytes(5000))
+            items = tracker.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200] * 4 + [370])
+            self.assertAlmostEqual(server.get_timer(), 0.946875)
+            self.assertSentPackets(server, [0, 0, 5])
+            self.assertEvents(server, [])
+            self.assertGreater(
+                tracker.sent[NEW_CLIENT_ADDR], 3 * tracker.received[NEW_CLIENT_ADDR]
+            )
 
     def test_migrate_amplification_limit_with_pacing(self) -> None:
         """
