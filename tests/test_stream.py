@@ -269,6 +269,67 @@ class QuicStreamTest(TestCase):
             StreamDataReceived(data=b"", end_stream=True, stream_id=0),
         )
 
+    def test_receiver_fragmented_gap_not_delivered(self) -> None:
+        stream = QuicStream(stream_id=0)
+
+        # Data arrives with a gap at [4, 8), nothing is delivered yet.
+        self.assertEqual(
+            stream.receiver.handle_frame(QuicStreamFrame(offset=8, data=b"89012345")),
+            None,
+        )
+
+        # Data before the gap is delivered on its own; the gap's zero-filled
+        # placeholder bytes must not be delivered as if they were received.
+        self.assertEqual(
+            stream.receiver.handle_frame(QuicStreamFrame(offset=0, data=b"0123")),
+            StreamDataReceived(data=b"0123", end_stream=False, stream_id=0),
+        )
+
+        # A duplicate of buffered data changes nothing.
+        self.assertEqual(
+            stream.receiver.handle_frame(QuicStreamFrame(offset=8, data=b"89012345")),
+            None,
+        )
+
+        # An overlapping fragment which does not fill the gap either.
+        self.assertEqual(
+            stream.receiver.handle_frame(QuicStreamFrame(offset=6, data=b"678901")),
+            None,
+        )
+
+        # Filling the gap delivers exactly the remaining bytes, in order.
+        self.assertEqual(
+            stream.receiver.handle_frame(QuicStreamFrame(offset=4, data=b"4567")),
+            StreamDataReceived(data=b"456789012345", end_stream=False, stream_id=0),
+        )
+        self.assertEqual(stream.receiver.highest_offset, 16)
+
+    def test_receiver_fragments_out_of_order_gapped(self) -> None:
+        stream = QuicStream(stream_id=0)
+
+        def frame(offset: int) -> QuicStreamFrame:
+            return QuicStreamFrame(offset=offset, data=f"{offset:08d}".encode())
+
+        # Fragments at odd strides arrive in reverse order, each of them
+        # duplicated; nothing can be delivered yet.
+        for offset in range(31992, 0, -16):
+            self.assertEqual(stream.receiver.handle_frame(frame(offset)), None)
+            self.assertEqual(stream.receiver.handle_frame(frame(offset)), None)
+
+        # Filling the gaps delivers each 16-byte chunk exactly once, in order.
+        for offset in range(0, 32000, 16):
+            self.assertEqual(
+                stream.receiver.handle_frame(frame(offset)),
+                StreamDataReceived(
+                    data=f"{offset:08d}".encode() + f"{offset + 8:08d}".encode(),
+                    end_stream=False,
+                    stream_id=0,
+                ),
+            )
+        self.assertEqual(bytes(stream.receiver._buffer), b"")
+        self.assertEqual(stream.receiver._buffer_start, 32000)
+        self.assertEqual(stream.receiver.highest_offset, 32000)
+
     def test_receiver_reset(self) -> None:
         stream = QuicStream(stream_id=0)
         self.assertEqual(

@@ -1,3 +1,5 @@
+import random
+
 from aioquic.quic.rangeset import RangeSet
 
 from .utils import TestCase
@@ -279,3 +281,45 @@ class RangeSetTest(TestCase):
     def test_repr(self) -> None:
         rangeset = RangeSet([range(1, 2), range(3, 4)])
         self.assertEqual(repr(rangeset), "RangeSet([range(1, 2), range(3, 4)])")
+
+    def test_stress(self) -> None:
+        # Compare the blocked storage against a naive model over a
+        # deterministic sequence of operations, forcing block splits and
+        # merges.
+        rng = random.Random(20261111)
+        rangeset = RangeSet()
+        points: set[int] = set()
+
+        def model_ranges() -> list[range]:
+            ranges: list[range] = []
+            for point in sorted(points):
+                if ranges and point == ranges[-1].stop:
+                    ranges[-1] = range(ranges[-1].start, point + 1)
+                else:
+                    ranges.append(range(point, point + 1))
+            return ranges
+
+        for i in range(1500):
+            start = rng.randrange(0, 4000)
+            stop = start + rng.randrange(1, 8)
+            op = rng.random()
+            if op < 0.5 or not points:
+                rangeset.add(start, stop)
+                points.update(range(start, stop))
+            elif op < 0.7:
+                rangeset.subtract(start, stop)
+                points.difference_update(range(start, stop))
+            elif op < 0.85:
+                if points:
+                    expected = model_ranges()[0]
+                    points.difference_update(expected)
+                    self.assertEqual(rangeset.shift(), expected)
+            else:
+                val = rng.randrange(0, 4100)
+                self.assertEqual(val in rangeset, val in points)
+
+            ranges = model_ranges()
+            self.assertEqual(list(rangeset), ranges)
+            self.assertEqual(len(rangeset), len(ranges))
+            for index in range(-len(ranges), len(ranges)):
+                self.assertEqual(rangeset[index], ranges[index])

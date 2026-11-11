@@ -4491,6 +4491,49 @@ class QuicConnectionTest(QuicConnectionTestCase):
             self.assertEqual(cm.exception.frame_type, QuicFrameType.CRYPTO)
             self.assertEqual(highest_good_offset, (MAX_PENDING_CRYPTO // 10000) * 10000)
 
+    def test_excessive_crypto_buffering_per_epoch(self) -> None:
+        """
+        The CRYPTO buffering limit applies to each encryption epoch
+        independently: filling one epoch's buffer does not consume the
+        allowance of the others.
+        """
+        with client_and_server() as (client, server):
+
+            def crypto_frame(offset: int) -> Buffer:
+                return Buffer(
+                    data=encode_uint_var(offset) + encode_uint_var(100) + b"\x00" * 100
+                )
+
+            # The client buffers data up to the limit in the INITIAL epoch.
+            for offset in range(10000, MAX_PENDING_CRYPTO + 1, 10000):
+                client._handle_crypto_frame(
+                    client_receive_context(client, epoch=tls.Epoch.INITIAL),
+                    QuicFrameType.CRYPTO,
+                    crypto_frame(offset),
+                )
+
+            # The HANDSHAKE epoch has its own allowance, even though the
+            # INITIAL epoch is already full.
+            for offset in range(10000, MAX_PENDING_CRYPTO + 1, 10000):
+                client._handle_crypto_frame(
+                    client_receive_context(client, epoch=tls.Epoch.HANDSHAKE),
+                    QuicFrameType.CRYPTO,
+                    crypto_frame(offset),
+                )
+
+            # Each epoch rejects data beyond its own limit.
+            for epoch in [tls.Epoch.INITIAL, tls.Epoch.HANDSHAKE]:
+                with self.assertRaises(QuicConnectionError) as cm:
+                    client._handle_crypto_frame(
+                        client_receive_context(client, epoch=epoch),
+                        QuicFrameType.CRYPTO,
+                        crypto_frame(MAX_PENDING_CRYPTO + 10000),
+                    )
+                self.assertEqual(
+                    cm.exception.error_code, QuicErrorCode.CRYPTO_BUFFER_EXCEEDED
+                )
+                self.assertEqual(cm.exception.frame_type, QuicFrameType.CRYPTO)
+
     def test_handle_data_blocked_frame(self) -> None:
         with client_and_server() as (client, server):
             # client receives DATA_BLOCKED: 12345
