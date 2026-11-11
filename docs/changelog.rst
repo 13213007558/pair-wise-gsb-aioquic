@@ -1,6 +1,15 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+* Add ``max_blocked_stream_data`` and ``max_blocked_data`` options to
+  :class:`~aioquic.h3.connection.H3Connection` to cap the received bytes held
+  while a HEADERS frame is blocked on a QPACK dynamic table update, per stream
+  and connection-wide. Exceeding either limit closes the connection with
+  ``H3_EXCESSIVE_LOAD`` as :rfc:`9114` section 4.2 permits.
+
 1.7.2
 -----
 

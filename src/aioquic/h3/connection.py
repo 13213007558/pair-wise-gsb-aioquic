@@ -22,6 +22,7 @@ from aioquic.quic.connection import (
     validate_stream_id,
 )
 from aioquic.quic.events import (
+    ConnectionTerminated,
     DatagramFrameReceived,
     QuicEvent,
     StopSendingReceived,
@@ -187,6 +188,16 @@ class SettingsError(ProtocolError):
 
 class StreamCreationError(ProtocolError):
     error_code = ErrorCode.H3_STREAM_CREATION_ERROR
+
+
+class ExcessiveLoadError(ProtocolError):
+    """
+    The peer buffered more request stream data than allowed while a HEADERS
+    frame was waiting for a QPACK dynamic table update (RFC 9114 section 4.2,
+    "excessive load").
+    """
+
+    error_code = ErrorCode.H3_EXCESSIVE_LOAD
 
 
 def encode_frame(frame_type: int, frame_data: bytes) -> bytes:
@@ -397,9 +408,18 @@ class H3Stream:
     def __init__(self, stream_id: int) -> None:
         self.blocked = False
         self.blocked_frame_size: int | None = None
+        # The number of received bytes which cannot be delivered to the
+        # application while the stream is blocked on a QPACK dynamic table
+        # update: the blocked HEADERS frame (its header plus the header block,
+        # held by the QPACK decoder), plus the request stream bytes accumulated
+        # in `buffer`.
+        self.blocked_buffered = 0
         self.buffer = b""
         self.receiving_ended = False
         self.sending_ended = False
+        # The header of the frame currently being parsed, retained because a
+        # frame header can span several QUIC STREAM events.
+        self.frame_header = b""
         self.frame_size: int | None = None
         self.frame_type: int | None = None
         self.headers_recv_state: HeadersState = HeadersState.INITIAL
@@ -427,15 +447,41 @@ class H3Connection:
 
     :param quic: A :class:`~aioquic.quic.connection.QuicConnection` instance.
     :param enable_webtransport: Whether to enable WebTransport.
+    :param max_blocked_stream_data:
+        The maximum number of received bytes which may be held for a single
+        stream while a HEADERS frame is blocked on a QPACK dynamic table
+        update. This counts the blocked HEADERS frame (its frame header and
+        header block) and every request stream byte received and buffered
+        before the block is decoded. ``None`` disables the per-stream limit.
+    :param max_blocked_data:
+        The connection-wide maximum number of received bytes held across all
+        streams blocked on QPACK dynamic table updates. ``None`` disables the
+        connection-wide limit.
     """
 
     def __init__(
-        self, quic: QuicConnection, *, enable_webtransport: bool = False
+        self,
+        quic: QuicConnection,
+        *,
+        enable_webtransport: bool = False,
+        max_blocked_stream_data: int | None = None,
+        max_blocked_data: int | None = None,
     ) -> None:
         # settings
         self._max_table_capacity = 4096
         self._blocked_streams = 16
         self._enable_webtransport = enable_webtransport
+
+        for name, value in (
+            ("max_blocked_stream_data", max_blocked_stream_data),
+            ("max_blocked_data", max_blocked_data),
+        ):
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be a non-negative integer or None")
+        self._max_blocked_stream_data = max_blocked_stream_data
+        self._max_blocked_data = max_blocked_data
+        # Total bytes currently held across all QPACK-blocked streams.
+        self._blocked_data_buffered = 0
 
         self._is_client = quic.configuration.is_client
         self._is_done = False
@@ -518,6 +564,8 @@ class H3Connection:
                     self._receive_stop_sending(event.stream_id)
                 elif isinstance(event, StreamReset):
                     self._receive_stream_reset(event.stream_id)
+                elif isinstance(event, ConnectionTerminated):
+                    self._receive_connection_terminated()
             except ProtocolError as exc:
                 self._is_done = True
                 self._quic.close(
@@ -671,6 +719,36 @@ class H3Connection:
         """
         self._quic.reset_stream(stream_id, ErrorCode.H3_REQUEST_INCOMPLETE)
 
+    def _account_blocked_data(self, stream: H3Stream, size: int) -> None:
+        """
+        Account for `size` received bytes held while `stream` is blocked on a
+        QPACK dynamic table update, and reject them if a configured limit is
+        exceeded.
+        """
+        stream.blocked_buffered += size
+        self._blocked_data_buffered += size
+
+        if (
+            self._max_blocked_stream_data is not None
+            and stream.blocked_buffered > self._max_blocked_stream_data
+        ) or (
+            self._max_blocked_data is not None
+            and self._blocked_data_buffered > self._max_blocked_data
+        ):
+            # The peer is generating excessive load by keeping request data
+            # blocked on QPACK updates (RFC 9114 section 4.2).
+            raise ExcessiveLoadError(
+                "Data buffered while waiting for a QPACK dynamic table update "
+                "exceeds the configured limit"
+            )
+
+    def _release_blocked_data(self, stream: H3Stream) -> None:
+        """
+        Return the bytes held for a QPACK-blocked stream to the budgets.
+        """
+        self._blocked_data_buffered -= stream.blocked_buffered
+        stream.blocked_buffered = 0
+
     def _check_stream_type_for_sending(self, stream_id: int) -> None:
         """
         Check the stream is a request stream, before any state is created for it.
@@ -743,6 +821,9 @@ class H3Connection:
         finally:
             # Don't forget to delete stream objects when they are done
             if stream.is_ended():
+                # A blocked stream is never "ended"; release its budget
+                # defensively in case the accounting was not already cleared.
+                self._release_blocked_data(stream)
                 self._stream.pop(stream_id)
 
     def _get_local_settings(self) -> dict[int, int]:
@@ -1057,6 +1138,10 @@ class H3Connection:
         if stream_ended:
             stream.receiving_ended = True
         if stream.blocked:
+            # The HEADERS frame is waiting for a QPACK dynamic table update,
+            # so every byte received on the stream has to be held until the
+            # stream is unblocked.
+            self._account_blocked_data(stream, len(data))
             return http_events
 
         # shortcut for WEBTRANSPORT_STREAM frame fragments
@@ -1105,12 +1190,15 @@ class H3Connection:
         while not buf.eof():
             # fetch next frame header
             if stream.frame_size is None:
+                frame_start = consumed
+                stream.frame_header = b""
                 try:
                     stream.frame_type = buf.pull_uint_var()
                     stream.frame_size = buf.pull_uint_var()
                 except BufferReadError:
                     break
                 consumed = buf.tell()
+                stream.frame_header = stream.buffer[frame_start:consumed]
 
                 self._check_request_frame_type(stream.frame_type)
 
@@ -1200,6 +1288,13 @@ class H3Connection:
             except pylsqpack.StreamBlocked:
                 stream.blocked = True
                 stream.blocked_frame_size = len(frame_data)
+                # The frame header is consumed out of `buffer` and the QPACK
+                # decoder holds the HEADERS block until the dynamic table
+                # update arrives; both are undelivered received bytes and so
+                # count towards the blocked data budgets.
+                self._account_blocked_data(
+                    stream, len(stream.frame_header) + len(frame_data)
+                )
                 break
 
         # remove processed data from buffer
@@ -1365,6 +1460,10 @@ class H3Connection:
         for stream_id in unblocked_streams:
             stream = self._stream[stream_id]
 
+            # The blocked HEADERS block and the buffered request stream bytes
+            # are about to be delivered, so release the budgets before resuming.
+            self._release_blocked_data(stream)
+
             # Resume the blocked HEADERS frame.
             http_events.extend(
                 self._handle_request_frame(
@@ -1389,6 +1488,15 @@ class H3Connection:
 
         return http_events
 
+    def _receive_connection_terminated(self) -> None:
+        """
+        Handle the QUIC connection being closed: no blocked data remains held.
+        """
+        self._blocked_data_buffered = 0
+        for stream in self._stream.values():
+            stream.blocked_buffered = 0
+        self._is_done = True
+
     def _receive_stream_reset(self, stream_id: int) -> None:
         """
         Handle the peer resetting a stream.
@@ -1410,6 +1518,7 @@ class H3Connection:
             self._quic.send_stream_data(self._local_decoder_stream_id, decoder)
 
         if stream is not None:
+            self._release_blocked_data(stream)
             stream.blocked = False
             stream.blocked_frame_size = None
             stream.buffer = b""

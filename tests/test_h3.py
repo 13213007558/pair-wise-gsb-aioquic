@@ -2131,6 +2131,333 @@ class H3ConnectionTest(TestCase):
                 ],
             )
 
+    # A blocked response: the HEADERS frame references a dynamic table entry
+    # whose encoder stream update is withheld. The hex payloads are taken from
+    # `test_blocked_stream`. The blocked HEADERS frame is 6 raw stream bytes
+    # (a 2-byte frame header and a 4-byte header block), all of which are held
+    # undelivered while the stream is blocked.
+    BLOCKED_SETTINGS = bytes.fromhex(
+        "0004170150000680020000074064091040bcc0000000faceb00c"
+    )
+    BLOCKED_HEADERS = bytes.fromhex("01040280d910")
+    UNBLOCK_ENCODER = bytes.fromhex(
+        "3fe101c696d07abe941094cb6d0a08017d403971966e32ca98b46f"
+    )
+    # Bytes held as soon as the stream becomes blocked: the whole HEADERS frame.
+    BLOCKED_HEADERS_SIZE = len(BLOCKED_HEADERS)
+
+    def _make_blocked_client(
+        self,
+        *,
+        max_blocked_stream_data: int | None = None,
+        max_blocked_data: int | None = None,
+    ) -> tuple[QuicConnection, H3Connection]:
+        quic_client, quic_server = h3_client_and_server().__enter__()
+        h3_client = H3Connection(
+            quic_client,
+            max_blocked_stream_data=max_blocked_stream_data,
+            max_blocked_data=max_blocked_data,
+        )
+        # peer's control stream (3), encoder stream (7) and decoder stream (11)
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3, data=self.BLOCKED_SETTINGS, end_stream=False
+            )
+        )
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=7, data=b"\x02", end_stream=False)
+        )
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=11, data=b"\x03", end_stream=False)
+        )
+        # the HEADERS frame blocks on the withheld encoder stream update
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=0, data=self.BLOCKED_HEADERS, end_stream=False
+                )
+            ),
+            [],
+        )
+        self.assertTrue(h3_client._stream[0].blocked)
+        return quic_client, h3_client
+
+    def test_blocked_stream_data_limit_invalid(self) -> None:
+        with h3_client_and_server() as (quic_client, quic_server):
+            with self.assertRaisesRegex(
+                ValueError, "max_blocked_stream_data must be a non-negative integer"
+            ):
+                H3Connection(quic_client, max_blocked_stream_data=-1)
+            with self.assertRaisesRegex(
+                ValueError, "max_blocked_data must be a non-negative integer"
+            ):
+                H3Connection(quic_client, max_blocked_data=-1)
+
+    def test_blocked_stream_data_limit_headers_only(self) -> None:
+        """
+        The blocked HEADERS frame counts towards the budgets, so a limit
+        smaller than it is exceeded as soon as the stream blocks, before any
+        DATA is received.
+        """
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=self.BLOCKED_HEADERS_SIZE - 1
+        )
+        self.assertEqual(
+            closed(quic_client),
+            (
+                ErrorCode.H3_EXCESSIVE_LOAD,
+                "Data buffered while waiting for a QPACK dynamic table update "
+                "exceeds the configured limit",
+            ),
+        )
+        self.assertTrue(h3_client._is_done)
+
+    def test_blocked_stream_data_split_frame_header(self) -> None:
+        """
+        A HEADERS frame whose header and header block arrive in separate
+        STREAM events is still accounted for exactly once.
+        """
+        quic_client, h3_client = h3_client_and_server().__enter__()
+        h3_client = H3Connection(
+            quic_client, max_blocked_stream_data=100, max_blocked_data=100
+        )
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=3, data=self.BLOCKED_SETTINGS, end_stream=False
+            )
+        )
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=7, data=b"\x02", end_stream=False)
+        )
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=11, data=b"\x03", end_stream=False)
+        )
+        for byte in self.BLOCKED_HEADERS:
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=0, data=bytes([byte]), end_stream=False
+                )
+            )
+
+        stream = h3_client._stream[0]
+        self.assertTrue(stream.blocked)
+        self.assertEqual(stream.blocked_buffered, self.BLOCKED_HEADERS_SIZE)
+        self.assertEqual(
+            h3_client._blocked_data_buffered, self.BLOCKED_HEADERS_SIZE
+        )
+        self.assertEqual(stream.buffer, b"")
+        self.assertIsNone(closed(quic_client))
+
+    def test_blocked_stream_data_per_stream_boundary(self) -> None:
+        """
+        Stream bytes received while blocked accumulate up to the per-stream
+        limit and the first byte past it terminates the connection with
+        H3_EXCESSIVE_LOAD.
+        """
+        limit = self.BLOCKED_HEADERS_SIZE + 6
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=limit
+        )
+
+        # 6 raw bytes (a DATA frame header plus its payload) bring the stream
+        # exactly to the limit and are still accepted.
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=0, data=b"\x00\x04abcd", end_stream=False
+                )
+            ),
+            [],
+        )
+        self.assertEqual(h3_client._stream[0].blocked_buffered, limit)
+        self.assertEqual(h3_client._blocked_data_buffered, limit)
+        self.assertIsNone(closed(quic_client))
+
+        # One more byte crosses the limit.
+        h3_client.handle_event(
+            StreamDataReceived(stream_id=0, data=b"e", end_stream=False)
+        )
+        self.assertEqual(closed(quic_client)[0], ErrorCode.H3_EXCESSIVE_LOAD)
+
+    def test_blocked_stream_data_connection_boundary(self) -> None:
+        """
+        The connection-wide budget is shared across all blocked streams.
+        """
+        limit = self.BLOCKED_HEADERS_SIZE + 6
+        quic_client, h3_client = self._make_blocked_client(max_blocked_data=limit)
+
+        # stream 0 reaches the connection-wide budget exactly.
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=0, data=b"\x00\x04abcd", end_stream=False
+                )
+            ),
+            [],
+        )
+        self.assertEqual(h3_client._blocked_data_buffered, limit)
+        self.assertIsNone(closed(quic_client))
+
+        # A second blocked stream's HEADERS frame would exceed the budget.
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=4, data=self.BLOCKED_HEADERS, end_stream=False
+            )
+        )
+        self.assertEqual(closed(quic_client)[0], ErrorCode.H3_EXCESSIVE_LOAD)
+
+    def test_blocked_stream_data_release_on_unblock(self) -> None:
+        """
+        Unblocking delivers the buffered DATA, returns the budget and leaves
+        the accounting at zero.
+        """
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=200, max_blocked_data=200
+        )
+        payload = b"you reached mvfst.net"
+        data_frame = encode_frame(FrameType.DATA, payload)
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=0, data=data_frame, end_stream=True
+            )
+        )
+        held = self.BLOCKED_HEADERS_SIZE + len(data_frame)
+        self.assertEqual(h3_client._stream[0].blocked_buffered, held)
+        self.assertEqual(h3_client._blocked_data_buffered, held)
+
+        # The encoder stream update unblocks the stream: both the HEADERS and
+        # the buffered DATA are delivered and the budgets are released.
+        events = h3_client.handle_event(
+            StreamDataReceived(stream_id=7, data=self.UNBLOCK_ENCODER, end_stream=False)
+        )
+        self.assertEqual(
+            events,
+            [
+                HeadersReceived(
+                    headers=[
+                        (b":status", b"200"),
+                        (b"date", b"Mon, 22 Jul 2019 06:33:33 GMT"),
+                    ],
+                    stream_id=0,
+                    stream_ended=False,
+                ),
+                DataReceived(
+                    data=payload, stream_id=0, stream_ended=True
+                ),
+            ],
+        )
+        # The stream's receiving half is finished and the budgets are released.
+        self.assertTrue(h3_client._stream[0].receiving_ended)
+        self.assertEqual(h3_client._blocked_data_buffered, 0)
+        self.assertEqual(h3_client._stream[0].blocked_buffered, 0)
+
+    def test_blocked_stream_data_release_on_reset(self) -> None:
+        """
+        Resetting a blocked stream releases its budget and the encoder stream
+        update arriving afterwards neither delivers nor re-creates the stream.
+        """
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=200, max_blocked_data=200
+        )
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=0, data=b"\x00\x04abcd", end_stream=False
+            )
+        )
+        held = self.BLOCKED_HEADERS_SIZE + 6
+        self.assertEqual(h3_client._blocked_data_buffered, held)
+
+        h3_client.handle_event(StreamReset(error_code=0, stream_id=0))
+        self.assertTrue(h3_client._stream[0].receiving_ended)
+        self.assertFalse(h3_client._stream[0].blocked)
+        self.assertEqual(h3_client._blocked_data_buffered, 0)
+
+        # The late table update must not resurrect the cancelled request.
+        self.assertEqual(
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=7, data=self.UNBLOCK_ENCODER, end_stream=False
+                )
+            ),
+            [],
+        )
+        self.assertEqual(h3_client._blocked_data_buffered, 0)
+        self.assertIsNone(closed(quic_client))
+
+    def test_blocked_stream_data_release_on_end_then_unblock(self) -> None:
+        """
+        A stream which ends (FIN) while blocked keeps its budget until the
+        table update arrives; the buffered content is then delivered once,
+        without duplication or loss.
+        """
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=200, max_blocked_data=200
+        )
+        payload = b"final bytes"
+        data_frame = encode_frame(FrameType.DATA, payload)
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=0, data=data_frame, end_stream=True
+            )
+        )
+        held = self.BLOCKED_HEADERS_SIZE + len(data_frame)
+        self.assertEqual(h3_client._blocked_data_buffered, held)
+        # FIN does not release the budget: the content is still undelivered.
+        self.assertIn(0, h3_client._stream)
+        self.assertTrue(h3_client._stream[0].receiving_ended)
+
+        events = h3_client.handle_event(
+            StreamDataReceived(stream_id=7, data=self.UNBLOCK_ENCODER, end_stream=False)
+        )
+        self.assertEqual(
+            events,
+            [
+                HeadersReceived(
+                    headers=[
+                        (b":status", b"200"),
+                        (b"date", b"Mon, 22 Jul 2019 06:33:33 GMT"),
+                    ],
+                    stream_id=0,
+                    stream_ended=False,
+                ),
+                DataReceived(
+                    data=payload, stream_id=0, stream_ended=True
+                ),
+            ],
+        )
+        # The whole message was delivered once and the budgets are released.
+        self.assertTrue(h3_client._stream[0].receiving_ended)
+        self.assertEqual(h3_client._blocked_data_buffered, 0)
+        self.assertEqual(h3_client._stream[0].blocked_buffered, 0)
+
+    def test_blocked_stream_data_release_on_connection_close(self) -> None:
+        """
+        A connection close releases every blocked stream's budget.
+        """
+        from aioquic.quic.events import ConnectionTerminated
+
+        quic_client, h3_client = self._make_blocked_client(
+            max_blocked_stream_data=200, max_blocked_data=200
+        )
+        h3_client.handle_event(
+            StreamDataReceived(
+                stream_id=0, data=b"\x00\x04abcd", end_stream=False
+            )
+        )
+        held = self.BLOCKED_HEADERS_SIZE + 6
+        self.assertEqual(h3_client._blocked_data_buffered, held)
+
+        self.assertEqual(
+            h3_client.handle_event(
+                ConnectionTerminated(
+                    error_code=0, frame_type=None, reason_phrase=""
+                )
+            ),
+            [],
+        )
+        self.assertEqual(h3_client._blocked_data_buffered, 0)
+        self.assertTrue(h3_client._is_done)
+
     def test_uni_stream_grease(self) -> None:
         with h3_client_and_server() as (quic_client, quic_server):
             h3_server = H3Connection(quic_server)
