@@ -658,6 +658,30 @@ class H3ConnectionTest(TestCase):
                 ),
             )
 
+    def test_handle_control_stream_close_before_settings(self) -> None:
+        """
+        Closing the control stream is not allowed, even before SETTINGS
+        are received (RFC 9114 section 6.2.1: "at any point").
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            # receive the stream type and FIN in a single event
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=3,
+                    data=encode_uint_var(StreamType.CONTROL),
+                    end_stream=True,
+                )
+            )
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Closing control stream is not allowed",
+                ),
+            )
+
     def test_handle_control_stream_duplicate(self) -> None:
         """
         We must only receive a single control stream.
@@ -813,6 +837,38 @@ class H3ConnectionTest(TestCase):
                 ),
             )
 
+    def test_handle_qpack_decoder_stream_close(self) -> None:
+        """
+        Closing the QPACK decoder stream is not allowed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=11,
+                    data=encode_uint_var(StreamType.QPACK_DECODER),
+                    end_stream=False,
+                )
+            )
+            self.assertIsNone(closed(quic_client))
+
+            # receive unexpected FIN
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=11,
+                    data=b"",
+                    end_stream=True,
+                )
+            )
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Closing a critical stream is not allowed",
+                ),
+            )
+
     def test_handle_qpack_decoder_stream_error(self) -> None:
         """
         Receiving garbage on the QPACK decoder stream triggers an exception.
@@ -829,6 +885,53 @@ class H3ConnectionTest(TestCase):
             )
             self.assertEqual(
                 closed(quic_client), (ErrorCode.QPACK_DECODER_STREAM_ERROR, "")
+            )
+
+    def test_handle_qpack_decoder_stream_reset(self) -> None:
+        """
+        Resetting the QPACK decoder stream is not allowed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=11,
+                    data=encode_uint_var(StreamType.QPACK_DECODER),
+                    end_stream=False,
+                )
+            )
+            self.assertIsNone(closed(quic_client))
+
+            # Receive unexpected RESET_STREAM.
+            h3_client.handle_event(StreamReset(error_code=0, stream_id=11))
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Resetting a critical stream is not allowed",
+                ),
+            )
+
+    def test_handle_qpack_decoder_stream_stop_sending(self) -> None:
+        """
+        Asking us to stop sending on our QPACK decoder stream is not allowed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            # Receive unexpected STOP_SENDING.
+            h3_client.handle_event(
+                StopSendingReceived(
+                    error_code=0, stream_id=h3_client._local_decoder_stream_id
+                )
+            )
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Stopping a critical stream is not allowed",
+                ),
             )
 
     def test_handle_qpack_encoder_duplicate(self) -> None:
@@ -860,6 +963,38 @@ class H3ConnectionTest(TestCase):
                 (
                     ErrorCode.H3_STREAM_CREATION_ERROR,
                     "Only one QPACK encoder stream is allowed",
+                ),
+            )
+
+    def test_handle_qpack_encoder_stream_close(self) -> None:
+        """
+        Closing the QPACK encoder stream is not allowed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=7,
+                    data=encode_uint_var(StreamType.QPACK_ENCODER),
+                    end_stream=False,
+                )
+            )
+            self.assertIsNone(closed(quic_client))
+
+            # receive unexpected FIN
+            h3_client.handle_event(
+                StreamDataReceived(
+                    stream_id=7,
+                    data=b"",
+                    end_stream=True,
+                )
+            )
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Closing a critical stream is not allowed",
                 ),
             )
 
@@ -904,6 +1039,27 @@ class H3ConnectionTest(TestCase):
                 (
                     ErrorCode.H3_CLOSED_CRITICAL_STREAM,
                     "Resetting a critical stream is not allowed",
+                ),
+            )
+
+    def test_handle_qpack_encoder_stream_stop_sending(self) -> None:
+        """
+        Asking us to stop sending on our QPACK encoder stream is not allowed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+
+            # Receive unexpected STOP_SENDING.
+            h3_client.handle_event(
+                StopSendingReceived(
+                    error_code=0, stream_id=h3_client._local_encoder_stream_id
+                )
+            )
+            self.assertEqual(
+                closed(quic_client),
+                (
+                    ErrorCode.H3_CLOSED_CRITICAL_STREAM,
+                    "Stopping a critical stream is not allowed",
                 ),
             )
 

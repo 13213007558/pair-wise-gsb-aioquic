@@ -1361,6 +1361,13 @@ class H3Connection:
         # remove processed data from buffer
         stream.buffer = stream.buffer[consumed:]
 
+        # Closing a QPACK stream is a connection error (RFC 9204 section 4.2).
+        if stream_ended and stream.stream_type in (
+            StreamType.QPACK_DECODER,
+            StreamType.QPACK_ENCODER,
+        ):
+            raise ClosedCriticalStream("Closing a critical stream is not allowed")
+
         # process unblocked streams
         for stream_id in unblocked_streams:
             stream = self._stream[stream_id]

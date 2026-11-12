@@ -38,6 +38,7 @@ APIs:
    design
    quic
    h3
+   h3_critical_streams
    asyncio
    changelog
    license
