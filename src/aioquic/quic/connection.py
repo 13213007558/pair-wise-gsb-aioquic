@@ -260,6 +260,250 @@ class QuicConnectionId:
     was_sent: bool = False
 
 
+class QuicPeerConnectionIdManager:
+    """
+    Own the lifecycle of the connection IDs supplied by the peer.
+
+    A peer connection ID is always in exactly one of three states:
+
+    - *active*: the single :attr:`active` ID used on the current path,
+    - *reserved*: held by a network path that is being validated
+      (``QuicNetworkPath.peer_cid``),
+    - *available*: not yet used and selectable for a path or rotation.
+
+    Retiring an ID moves it out of those states and appends its sequence
+    number to :attr:`retire_pending`, which drives RETIRE_CONNECTION_ID
+    frames. Every transition goes through a method of this class so that the
+    available -> (active|reserved) -> retired flow can be reviewed in one
+    place.
+    """
+
+    def __init__(self, active: QuicConnectionId) -> None:
+        self.active = active
+        self.available: list[QuicConnectionId] = []
+        self.known_sequences: set[int] = set()
+        if active.sequence_number is not None:
+            self.known_sequences.add(active.sequence_number)
+        self.retire_prior_to = 0
+        self.retire_pending: list[int] = []
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+    @staticmethod
+    def active_connection_id_count(
+        available_count: int, reserved_count: int
+    ) -> int:
+        """
+        Count the connection IDs counted toward the peer's
+        active_connection_id_limit: the active one, every available one and
+        every ID reserved for a path being validated.
+        """
+        return 1 + available_count + reserved_count
+
+    # ------------------------------------------------------------------
+    # available -> (active | reserved)
+    # ------------------------------------------------------------------
+    def consume(self) -> QuicConnectionId:
+        """
+        Promote an available connection ID to active.
+        """
+        return self.available.pop(0)
+
+    def reserve(self) -> QuicConnectionId:
+        """
+        Take an available connection ID to reserve it for a network path.
+        """
+        return self.available.pop(0)
+
+    def bind_active(self, cid: bytes, sequence_number: int) -> None:
+        """
+        Bind the active connection ID to the first source connection ID
+        received from the peer, assigning its sequence number.
+        """
+        self.active.cid = cid
+        self.active.sequence_number = sequence_number
+        self.known_sequences.add(sequence_number)
+
+    def add_available(self, connection_id: QuicConnectionId) -> None:
+        """
+        Track a connection ID the peer made available out of band, such as
+        the one carried in a preferred address transport parameter.
+        """
+        self.available.append(connection_id)
+        self.known_sequences.add(connection_id.sequence_number)
+
+    def use_reserved(self, network_path: "QuicNetworkPath") -> None:
+        """
+        Promote a connection ID reserved for a network path to active,
+        retiring the previously active ID.
+        """
+        connection_id = network_path.peer_cid
+        assert connection_id is not None
+        self.retire(self.active)
+        self.active = connection_id
+        network_path.peer_cid = None
+
+    # ------------------------------------------------------------------
+    # (active | available | reserved) -> retired
+    # ------------------------------------------------------------------
+    def retire(self, connection_id: QuicConnectionId) -> None:
+        """
+        Retire a connection ID by queueing a RETIRE_CONNECTION_ID frame.
+        """
+        self.retire_pending.append(connection_id.sequence_number)
+
+    def release_reserved(self, network_path: "QuicNetworkPath") -> None:
+        """
+        Retire the connection ID reserved for a network path and detach it,
+        leaving no dangling reference on the path.
+        """
+        connection_id = network_path.peer_cid
+        if connection_id is not None:
+            network_path.peer_cid = None
+            self.retire(connection_id)
+
+    # ------------------------------------------------------------------
+    # NEW_CONNECTION_ID
+    # ------------------------------------------------------------------
+    def apply_new_connection_id(
+        self,
+        *,
+        frame_type: int,
+        sequence_number: int,
+        retire_prior_to: int,
+        connection_id: QuicConnectionId,
+        network_paths: Sequence["QuicNetworkPath"],
+        active_connection_id_limit: int,
+        max_pending_retirements: int,
+    ) -> bool:
+        """
+        Apply a NEW_CONNECTION_ID frame atomically.
+
+        All validation is performed against a computed plan before any state
+        is touched, so a rejected frame never leaves a half-updated network
+        path reference, a rotated active ID, or a consumed active connection
+        ID quota. Returns whether the active connection ID changed.
+        """
+        if retire_prior_to > sequence_number:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                frame_type=frame_type,
+                reason_phrase="Retire Prior To is greater than Sequence Number",
+            )
+
+        new_retire_prior_to = max(retire_prior_to, self.retire_prior_to)
+
+        # Plan the retirement of every ID below retire_prior_to. Each ID is
+        # reached through exactly one state, so it is queued at most once.
+        retiring: list[QuicConnectionId] = [
+            cid
+            for cid in self.available
+            if cid.sequence_number < new_retire_prior_to
+        ]
+        active_retired = self.active.sequence_number < new_retire_prior_to
+        if active_retired:
+            retiring.insert(0, self.active)
+        reserved_paths = [
+            network_path
+            for network_path in network_paths
+            if network_path.peer_cid is not None
+            and network_path.peer_cid.sequence_number < new_retire_prior_to
+        ]
+        retiring.extend(
+            network_path.peer_cid
+            for network_path in reserved_paths
+            if network_path.peer_cid is not None
+        )
+
+        # Plan the post-frame available pool and the optional new ID.
+        new_available = [
+            cid
+            for cid in self.available
+            if cid.sequence_number >= new_retire_prior_to
+        ]
+        adding = (
+            sequence_number >= new_retire_prior_to
+            and sequence_number not in self.known_sequences
+        )
+        if adding:
+            new_available.append(connection_id)
+
+        # Rotating the active ID needs a replacement taken from the pool.
+        replacement: QuicConnectionId | None = None
+        if active_retired:
+            if not new_available:
+                raise QuicConnectionError(
+                    error_code=QuicErrorCode.PROTOCOL_VIOLATION,
+                    frame_type=frame_type,
+                    reason_phrase=(
+                        "Retire Prior To retires the active connection ID "
+                        "without a replacement"
+                    ),
+                )
+            replacement = new_available.pop(0)
+
+        # Validate the resulting active connection ID count before mutating:
+        # one active ID, the post-frame available pool and the still-reserved
+        # path IDs.
+        remaining_reserved = (
+            sum(
+                1
+                for network_path in network_paths
+                if network_path.peer_cid is not None
+            )
+            - len(reserved_paths)
+        )
+        if (
+            self.active_connection_id_count(
+                available_count=len(new_available),
+                reserved_count=remaining_reserved,
+            )
+            > active_connection_id_limit
+        ):
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                frame_type=frame_type,
+                reason_phrase="Too many active connection IDs",
+            )
+
+        # Validate the number of queued retirements before mutating. The
+        # queue may transiently exceed this when unacked frames are added
+        # back through retransmission, which is bounded and handled
+        # elsewhere.
+        if len(self.retire_pending) + len(retiring) > max_pending_retirements:
+            raise QuicConnectionError(
+                error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
+                frame_type=frame_type,
+                reason_phrase="Too many pending retired connection IDs",
+            )
+
+        # Commit. From here on the frame cannot fail: references, pools and
+        # the retirement queue are updated together.
+        for network_path in reserved_paths:
+            network_path.peer_cid = None
+        self.available = new_available
+        self.known_sequences = {
+            seq
+            for seq in self.known_sequences
+            if seq >= new_retire_prior_to
+        }
+        if adding:
+            self.known_sequences.add(sequence_number)
+        self.retire_prior_to = new_retire_prior_to
+        for retired in retiring:
+            self.retire(retired)
+        if replacement is not None:
+            self.active = replacement
+        return active_retired
+
+    def requeue_lost_retirement(self, sequence_number: int) -> None:
+        """
+        Re-queue a RETIRE_CONNECTION_ID frame whose delivery failed.
+        """
+        self.retire_pending.append(sequence_number)
+
+
 class QuicConnectionState(Enum):
     FIRSTFLIGHT = 0
     CONNECTED = 1
@@ -426,12 +670,12 @@ class QuicConnection:
         self._network_paths: list[QuicNetworkPath] = []
         self._pacing_at: float | None = None
         self._packet_number = 0
-        self._peer_cid = QuicConnectionId(
-            cid=os.urandom(configuration.connection_id_length), sequence_number=None
+        self._peer_cid_manager = QuicPeerConnectionIdManager(
+            QuicConnectionId(
+                cid=os.urandom(configuration.connection_id_length),
+                sequence_number=None,
+            )
         )
-        self._peer_cid_available: list[QuicConnectionId] = []
-        self._peer_cid_sequence_numbers: set[int] = set([0])
-        self._peer_retire_prior_to = 0
         self._peer_token = configuration.token
         self._quic_logger: QuicLoggerTrace | None = None
         self._remote_ack_delay_exponent = 3
@@ -497,7 +741,6 @@ class QuicConnection:
         self._handshake_done_pending = False
         self._ping_pending: list[int] = []
         self._probe_pending = False
-        self._retire_connection_ids: list[int] = []
         self._streams_blocked_pending = False
 
         # callbacks
@@ -551,6 +794,31 @@ class QuicConnection:
     def original_destination_connection_id(self) -> bytes:
         return self._original_destination_connection_id
 
+    # Backwards-compatible views over the peer connection ID manager's state.
+    @property
+    def _peer_cid(self) -> QuicConnectionId:
+        return self._peer_cid_manager.active
+
+    @_peer_cid.setter
+    def _peer_cid(self, connection_id: QuicConnectionId) -> None:
+        self._peer_cid_manager.active = connection_id
+
+    @property
+    def _peer_cid_available(self) -> list[QuicConnectionId]:
+        return self._peer_cid_manager.available
+
+    @property
+    def _peer_cid_sequence_numbers(self) -> set[int]:
+        return self._peer_cid_manager.known_sequences
+
+    @property
+    def _peer_retire_prior_to(self) -> int:
+        return self._peer_cid_manager.retire_prior_to
+
+    @property
+    def _retire_connection_ids(self) -> list[int]:
+        return self._peer_cid_manager.retire_pending
+
     def change_connection_id(self) -> None:
         """
         Switch to the next available connection ID and retire
@@ -558,12 +826,14 @@ class QuicConnection:
 
         .. aioquic_transmit::
         """
-        if self._peer_cid_available:
+        manager = self._peer_cid_manager
+        if manager.available:
             # retire previous CID
-            self._retire_peer_cid(self._peer_cid)
+            manager.retire(manager.active)
 
             # assign new CID
-            self._consume_peer_cid()
+            self._peer_cid = manager.consume()
+            self._spin_bit = False
 
     def close(
         self,
@@ -739,7 +1009,7 @@ class QuicConnection:
                     probe_path.is_validated or probe_path.local_challenge_sent
                 ):
                     if probe_path.peer_cid is None and self._peer_cid_available:
-                        probe_path.peer_cid = self._peer_cid_available.pop(0)
+                        probe_path.peer_cid = self._peer_cid_manager.reserve()
                     if probe_path.peer_cid is not None:
                         ret += self._send_probing_frames(
                             network_path=probe_path, now=now
@@ -1178,8 +1448,9 @@ class QuicConnection:
 
             # update state
             if self._peer_cid.sequence_number is None:
-                self._peer_cid.cid = header.source_cid
-                self._peer_cid.sequence_number = 0
+                self._peer_cid_manager.bind_active(
+                    cid=header.source_cid, sequence_number=0
+                )
 
             if self._state == QuicConnectionState.FIRSTFLIGHT:
                 self._remote_initial_source_connection_id = header.source_cid
@@ -1624,23 +1895,6 @@ class QuicConnection:
                 frame_type=frame_type,
                 reason_phrase="Stream is receive-only",
             )
-
-    def _consume_peer_cid(self) -> None:
-        """
-        Update the destination connection ID by taking the next
-        available connection ID provided by the peer.
-        """
-
-        self._peer_cid = self._peer_cid_available.pop(0)
-        self._logger.debug(
-            "Switching to CID %s (%d)",
-            dump_cid(self._peer_cid.cid),
-            self._peer_cid.sequence_number,
-        )
-
-        # RFC 9000 section 17.4 requires resetting the spin value when changing
-        # the connection ID used on a network path.
-        self._spin_bit = False
 
     def _close_begin(self, is_initiator: bool, now: float) -> None:
         """
@@ -2511,98 +2765,27 @@ class QuicConnection:
                 )
             )
 
-        # sanity check
-        if retire_prior_to > sequence_number:
-            raise QuicConnectionError(
-                error_code=QuicErrorCode.PROTOCOL_VIOLATION,
-                frame_type=frame_type,
-                reason_phrase="Retire Prior To is greater than Sequence Number",
-            )
-
-        # only accept retire_prior_to if it is bigger than the one we know
-        self._peer_retire_prior_to = max(retire_prior_to, self._peer_retire_prior_to)
-
-        # determine which CIDs to retire
-        change_cid = False
-        retire = [
-            cid
-            for cid in self._peer_cid_available
-            if cid.sequence_number < self._peer_retire_prior_to
-        ]
-        if self._peer_cid.sequence_number < self._peer_retire_prior_to:
-            change_cid = True
-            retire.insert(0, self._peer_cid)
-        for network_path in self._network_paths:
-            if (
-                network_path.peer_cid is not None
-                and network_path.peer_cid.sequence_number < self._peer_retire_prior_to
-            ):
-                retire.append(network_path.peer_cid)
-                network_path.peer_cid = None
-
-        # update available CIDs
-        self._peer_cid_available = [
-            cid
-            for cid in self._peer_cid_available
-            if cid.sequence_number >= self._peer_retire_prior_to
-        ]
-        self._peer_cid_sequence_numbers = set(
-            seq
-            for seq in self._peer_cid_sequence_numbers
-            if seq >= self._peer_retire_prior_to
-        )
-        if (
-            sequence_number >= self._peer_retire_prior_to
-            and sequence_number not in self._peer_cid_sequence_numbers
+        # The manager validates the whole frame and applies it atomically:
+        # a rejected frame leaves every connection ID and network path
+        # reference untouched and consumes no active connection ID quota.
+        if self._peer_cid_manager.apply_new_connection_id(
+            frame_type=frame_type,
+            sequence_number=sequence_number,
+            retire_prior_to=retire_prior_to,
+            connection_id=QuicConnectionId(
+                cid=connection_id,
+                sequence_number=sequence_number,
+                stateless_reset_token=stateless_reset_token,
+            ),
+            network_paths=self._network_paths,
+            active_connection_id_limit=self._local_active_connection_id_limit,
+            max_pending_retirements=min(
+                self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
+            ),
         ):
-            self._peer_cid_available.append(
-                QuicConnectionId(
-                    cid=connection_id,
-                    sequence_number=sequence_number,
-                    stateless_reset_token=stateless_reset_token,
-                )
-            )
-            self._peer_cid_sequence_numbers.add(sequence_number)
-
-        # retire previous CIDs
-        for quic_connection_id in retire:
-            self._retire_peer_cid(quic_connection_id)
-
-        # assign new CID if we retired the active one
-        if change_cid:
-            self._consume_peer_cid()
-
-        # Check the number of active connection IDs, including the selected one and
-        # those reserved for paths being validated.
-        reserved_count = sum(
-            1
-            for network_path in self._network_paths
-            if network_path.peer_cid is not None
-        )
-        if (
-            1 + len(self._peer_cid_available) + reserved_count
-            > self._local_active_connection_id_limit
-        ):
-            raise QuicConnectionError(
-                error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
-                frame_type=frame_type,
-                reason_phrase="Too many active connection IDs",
-            )
-
-        # Check the number of retired connection IDs pending, though with a safer limit
-        # than the 2x recommended in section 5.1.2 of the RFC.  Note that we are doing
-        # the check here and not in _retire_peer_cid() because we know the frame type to
-        # use here, and because it is the new connection id path that is potentially
-        # dangerous.  We may transiently go a bit over the limit due to unacked frames
-        # getting added back to the list, but that's ok as it is bounded.
-        if len(self._retire_connection_ids) > min(
-            self._local_active_connection_id_limit * 4, MAX_PENDING_RETIRES
-        ):
-            raise QuicConnectionError(
-                error_code=QuicErrorCode.CONNECTION_ID_LIMIT_ERROR,
-                frame_type=frame_type,
-                reason_phrase="Too many pending retired connection IDs",
-            )
+            # RFC 9000 section 17.4 requires resetting the spin value when
+            # the connection ID used on a network path changes.
+            self._spin_bit = False
 
     def _handle_new_token_frame(
         self, context: QuicReceiveContext, frame_type: int, buf: Buffer
@@ -3104,7 +3287,7 @@ class QuicConnection:
         Callback when a RETIRE_CONNECTION_ID frame is acknowledged or lost.
         """
         if delivery != QuicDeliveryState.ACKED:
-            self._retire_connection_ids.append(sequence_number)
+            self._peer_cid_manager.requeue_lost_retirement(sequence_number)
 
     def _path_validation_deadline(self) -> float | None:
         """
@@ -3221,7 +3404,7 @@ class QuicConnection:
         # Reserve a connection ID for this path, as a connection ID must not be
         # used to send to more than one destination address.
         network_path = QuicNetworkPath(addr)
-        network_path.peer_cid = self._peer_cid_available.pop(0)
+        network_path.peer_cid = self._peer_cid_manager.reserve()
         self._add_network_path(network_path)
         self._logger.debug("Probing server preferred address %s", addr)
 
@@ -3417,7 +3600,7 @@ class QuicConnection:
             connection_id.sequence_number,
             len(self._retire_connection_ids) + 1,
         )
-        self._retire_connection_ids.append(connection_id.sequence_number)
+        self._peer_cid_manager.retire(connection_id)
 
     def _push_crypto_data(self) -> None:
         for epoch, buf in self._crypto_buffers.items():
@@ -3628,14 +3811,13 @@ class QuicConnection:
             if self._is_client and preferred_address is not None:
                 # The connection ID in the preferred address has sequence number 1,
                 # and the client may use it on any path.
-                self._peer_cid_available.append(
+                self._peer_cid_manager.add_available(
                     QuicConnectionId(
                         cid=preferred_address.connection_id,
                         sequence_number=1,
                         stateless_reset_token=preferred_address.stateless_reset_token,
                     )
                 )
-                self._peer_cid_sequence_numbers.add(1)
                 # Migrating is optional (RFC 9000 section 9.6.1).
                 if self._configuration.migrate_to_preferred_address:
                     self._remote_preferred_address = preferred_address
@@ -3890,8 +4072,7 @@ class QuicConnection:
             )
             self._network_paths.remove(evicted)
             self._logger.debug("Network path %s evicted", evicted.addr)
-            if evicted.peer_cid is not None:
-                self._retire_peer_cid(evicted.peer_cid)
+            self._peer_cid_manager.release_reserved(evicted)
 
         self._network_paths.append(network_path)
 
@@ -3900,10 +4081,7 @@ class QuicConnection:
         Switch to the peer connection ID reserved for a network path, retiring the
         current one.
         """
-        assert network_path.peer_cid is not None
-        self._retire_peer_cid(self._peer_cid)
-        self._peer_cid = network_path.peer_cid
-        network_path.peer_cid = None
+        self._peer_cid_manager.use_reserved(network_path)
 
         # RFC 9000 section 17.4 requires resetting the spin value when changing
         # the connection ID used on a network path.
@@ -3978,11 +4156,11 @@ class QuicConnection:
                         )
 
                 # RETIRE_CONNECTION_ID
-                for sequence_number in self._retire_connection_ids[:]:
+                for sequence_number in self._peer_cid_manager.retire_pending[:]:
                     self._write_retire_connection_id_frame(
                         builder=builder, sequence_number=sequence_number
                     )
-                    self._retire_connection_ids.pop(0)
+                    self._peer_cid_manager.retire_pending.pop(0)
 
                 # STREAMS_BLOCKED
                 if self._streams_blocked_pending:

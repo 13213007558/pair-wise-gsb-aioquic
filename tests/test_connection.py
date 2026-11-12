@@ -193,14 +193,15 @@ def new_connection_id(
     sequence_number: int,
     retire_prior_to: int = 0,
     connection_id: bytes = bytes(8),
+    stateless_reset_token: bytes = bytes(16),
     capacity: int = 100,
 ) -> Buffer:
     buf = Buffer(capacity=capacity)
     buf.push_uint_var(sequence_number)
     buf.push_uint_var(retire_prior_to)
-    buf.push_uint_var(len(connection_id))
+    buf.push_uint8(len(connection_id))
     buf.push_bytes(connection_id)
-    buf.push_bytes(bytes(16))  # stateless reset token
+    buf.push_bytes(stateless_reset_token)
     buf.seek(0)
     return buf
 
@@ -4897,6 +4898,191 @@ class QuicConnectionTest(QuicConnectionTestCase):
                 cm.exception.reason_phrase,
                 "Retire Prior To is greater than Sequence Number",
             )
+
+    def test_handle_new_connection_id_duplicate_with_different_content(self) -> None:
+        with client_and_server() as (client, server):
+            # Sequence number 7 was already advertised during the handshake.
+            original = next(
+                cid for cid in client._peer_cid_available
+                if cid.sequence_number == 7
+            )
+            buf = new_connection_id(
+                sequence_number=7,
+                connection_id=b"\x07" * 8,
+                stateless_reset_token=b"\xaa" * 16,
+            )
+
+            # The duplicate is ignored: the stored CID and token win, and no
+            # second entry nor extra retirement is produced.
+            client._handle_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.NEW_CONNECTION_ID,
+                buf,
+            )
+            stored = next(
+                cid for cid in client._peer_cid_available
+                if cid.sequence_number == 7
+            )
+            self.assertIs(stored, original)
+            self.assertNotEqual(stored.cid, b"\x07" * 8)
+            self.assertEqual(
+                sequence_numbers(client._peer_cid_available), [1, 2, 3, 4, 5, 6, 7]
+            )
+            self.assertEqual(client._peer_cid_sequence_numbers, set(range(0, 8)))
+            self.assertEqual(client._retire_connection_ids, [])
+
+    def test_handle_new_connection_id_retire_prior_to_spans_many(self) -> None:
+        with client_and_server() as (client, server):
+            # A path holds a reserved connection ID while retire_prior_to jumps
+            # over the active, available and reserved IDs at once.
+            reserved = client._peer_cid_manager.reserve()
+            probe_path = QuicNetworkPath(("1.2.3.4", 443))
+            probe_path.peer_cid = reserved
+            client._add_network_path(probe_path)
+            self.assertEqual(reserved.sequence_number, 1)
+
+            buf = new_connection_id(sequence_number=8, retire_prior_to=5)
+            client._handle_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.NEW_CONNECTION_ID,
+                buf,
+            )
+
+            # Active rotated to the first surviving available ID.
+            self.assertEqual(client._peer_cid.sequence_number, 5)
+            # The reserved ID was retired and detached without a dangling ref.
+            self.assertIsNone(probe_path.peer_cid)
+            # Every sequence number below retire_prior_to is queued exactly
+            # once: the active ID first, then the available ones, then the ID
+            # that had been reserved for the probe path.
+            self.assertEqual(
+                sorted(client._retire_connection_ids), [0, 1, 2, 3, 4]
+            )
+            self.assertEqual(
+                len(client._retire_connection_ids),
+                len(set(client._retire_connection_ids)),
+            )
+            self.assertEqual(
+                sequence_numbers(client._peer_cid_available), [6, 7, 8]
+            )
+            self.assertEqual(client._peer_retire_prior_to, 5)
+
+    def test_handle_new_connection_id_retire_active_during_migration(self) -> None:
+        with client_and_server() as (client, server):
+            # A migration path has a connection ID reserved for it.
+            reserved = client._peer_cid_manager.reserve()
+            probe_path = QuicNetworkPath(("1.2.3.4", 443))
+            probe_path.peer_cid = reserved
+            client._add_network_path(probe_path)
+            self.assertEqual(reserved.sequence_number, 1)
+
+            # The peer retires the active ID (0) but leaves the reserved one (1).
+            buf = new_connection_id(sequence_number=8, retire_prior_to=1)
+            client._handle_new_connection_id_frame(
+                client_receive_context(client),
+                QuicFrameType.NEW_CONNECTION_ID,
+                buf,
+            )
+
+            # Active rotated, the migration reservation is preserved and the
+            # old active ID produced exactly one retirement.
+            self.assertEqual(client._peer_cid.sequence_number, 2)
+            self.assertIsNotNone(probe_path.peer_cid)
+            self.assertEqual(probe_path.peer_cid.sequence_number, 1)
+            self.assertEqual(client._retire_connection_ids, [0])
+            self.assertEqual(
+                sequence_numbers(client._peer_cid_available), [3, 4, 5, 6, 7, 8]
+            )
+
+            # Promoting the reserved path retires the rotated active ID.
+            client._use_reserved_peer_cid(probe_path)
+            self.assertEqual(client._peer_cid.sequence_number, 1)
+            self.assertIsNone(probe_path.peer_cid)
+            self.assertEqual(client._retire_connection_ids, [0, 2])
+
+    def test_handle_new_connection_id_over_limit_is_atomic(self) -> None:
+        with client_and_server() as (client, server):
+            # Snapshot the state a rejected frame must leave untouched.
+            before_active = client._peer_cid
+            before_available = sequence_numbers(client._peer_cid_available)
+            before_known = set(client._peer_cid_sequence_numbers)
+            before_retire_prior_to = client._peer_retire_prior_to
+            before_pending = list(client._retire_connection_ids)
+            probe_path = QuicNetworkPath(("1.2.3.4", 443))
+            probe_path.peer_cid = client._peer_cid_manager.reserve()
+            client._add_network_path(probe_path)
+            reserved = probe_path.peer_cid
+
+            # Adding one more ID exceeds active_connection_id_limit.
+            with self.assertRaises(QuicConnectionError) as cm:
+                client._handle_new_connection_id_frame(
+                    client_receive_context(client),
+                    QuicFrameType.NEW_CONNECTION_ID,
+                    new_connection_id(sequence_number=8),
+                )
+            self.assertEqual(
+                cm.exception.error_code, QuicErrorCode.CONNECTION_ID_LIMIT_ERROR
+            )
+
+            # Nothing was consumed, rotated, detached or queued.
+            self.assertIs(client._peer_cid, before_active)
+            self.assertEqual(
+                sequence_numbers(client._peer_cid_available),
+                before_available[1:],
+            )
+            self.assertEqual(client._peer_cid_sequence_numbers, before_known)
+            self.assertEqual(client._peer_retire_prior_to, before_retire_prior_to)
+            self.assertEqual(client._retire_connection_ids, before_pending)
+            self.assertIs(probe_path.peer_cid, reserved)
+
+    def test_handle_new_connection_id_retire_active_without_replacement(self) -> None:
+        # A valid frame obeys retire_prior_to <= sequence_number and carries
+        # its own new ID, so an active-ID retirement normally always has a
+        # replacement. Exercise the defensive guard directly to prove a
+        # missing replacement raises instead of popping from an empty pool.
+        with client_and_server() as (client, server):
+            manager = client._peer_cid_manager
+            manager.available.clear()
+            # Make the frame's sequence number already known so it is not
+            # added back as a replacement.
+            manager.known_sequences.add(5)
+
+            with self.assertRaises(QuicConnectionError) as cm:
+                manager.apply_new_connection_id(
+                    frame_type=QuicFrameType.NEW_CONNECTION_ID,
+                    sequence_number=5,
+                    retire_prior_to=5,
+                    connection_id=QuicConnectionId(
+                        cid=b"\x05" * 8, sequence_number=5
+                    ),
+                    network_paths=client._network_paths,
+                    active_connection_id_limit=client._local_active_connection_id_limit,
+                    max_pending_retirements=100,
+                )
+            self.assertEqual(
+                cm.exception.error_code, QuicErrorCode.PROTOCOL_VIOLATION
+            )
+            # The rejection left the active ID in place.
+            self.assertEqual(client._peer_cid.sequence_number, 0)
+
+    def test_retire_connection_id_retransmission(self) -> None:
+        with client_and_server() as (client, server):
+            client.change_connection_id()
+            self.assertEqual(client._retire_connection_ids, [0])
+
+            # The frame is written and dequeued.
+            self.assertEqual(drop(client), 1)
+            self.assertEqual(client._retire_connection_ids, [])
+
+            # Loss puts the sequence number back, and it is sent again once.
+            client._on_retire_connection_id_delivery(QuicDeliveryState.LOST, 0)
+            self.assertEqual(client._retire_connection_ids, [0])
+            self.assertEqual(drop(client), 1)
+            self.assertEqual(client._retire_connection_ids, [])
+
+            # An acknowledgement does not requeue anything.
+            client._on_retire_connection_id_delivery(QuicDeliveryState.ACKED, 0)
+            self.assertEqual(client._retire_connection_ids, [])
 
     def test_handle_new_token_frame(self) -> None:
         new_token = None
